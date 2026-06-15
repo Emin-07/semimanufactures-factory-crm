@@ -327,7 +327,7 @@ const DashboardPage = () => {
   return (
     <div className="dashboard-page" style={{ animation: "softFadeIn .4s ease" }}>
       <PageH title={`Привет, ${currentUser.name.split(" ")[1] || currentUser.name} 👋`} sub={`${role?.label} · ${fmtShort(new Date().toISOString())}`}>
-        <Btn onClick={() => setPage("tasks")} icon={<I.plus size={14} />}>+ Задание</Btn>
+        <Btn onClick={() => setPage("tasks")} icon={<I.plus size={14} />}>Задание</Btn>
         <Btn v="secondary" onClick={() => setPage("prodOutput")} icon={<I.factory size={14} />}>Выпуск</Btn>
       </PageH>
 

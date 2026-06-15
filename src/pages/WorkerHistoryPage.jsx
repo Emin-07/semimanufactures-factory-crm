@@ -60,7 +60,7 @@ const WorkerHistoryPage = ()=>{
             <div style={{width:50,height:50,borderRadius:12,background:`linear-gradient(135deg, ${C.primary}25, ${C.primary}10)`,display:"flex",alignItems:"center",justifyContent:"center",color:C.primary,fontWeight:800,fontSize:20,border:`2px solid ${C.primary}30`}}>{worker.name.charAt(0)}</div>
             <div style={{flex:"1 1 200px"}}>
               <div style={{fontSize:17,fontWeight:700,color:C.text}}>{worker.name}</div>
-              <div style={{fontSize:12,color:C.muted,marginTop:2}}>{ROLES.find(r=>r.id===worker.roleId)?.label} \u00b7 {worker.email}</div>
+              <div style={{fontSize:12,color:C.muted,marginTop:2}}>{ROLES.find(r=>r.id===worker.roleId)?.label}{" \u00b7 "}{worker.email}</div>
             </div>
             <div style={{display:"flex",gap:12,flexWrap:"wrap"}}>
               <div style={{background:C.bg,borderRadius:8,padding:"8px 14px",textAlign:"center",border:`1px solid ${C.border}`}}>

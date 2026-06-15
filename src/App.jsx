@@ -354,7 +354,7 @@ export default function App(){
     }
     .glass-chip:hover{background:rgba(255,255,255,.08);border-color:rgba(255,255,255,.14)}
     .nav-item{
-      display:flex;align-items:center;gap:9;width:100%;
+      display:flex;align-items:center;gap:9px;width:100%;
       padding:9px 12px;border:none;border-radius:12;
       background:transparent;color:${C.muted};
       font-size:13;font-weight:500;cursor:pointer;
@@ -370,7 +370,7 @@ export default function App(){
       box-shadow:0 4px 20px rgba(211,166,70,.08);
     }
     .nav-sub-item{
-      display:flex;align-items:center;gap:9;width:100%;
+      display:flex;align-items:center;gap:9px;width:100%;
       padding:7px 11px 7px 38px;border:none;border-radius:10;
       background:transparent;color:${C.dim};
       font-size:12;font-weight:400;cursor:pointer;
@@ -385,7 +385,7 @@ export default function App(){
       font-weight:600;
     }
     .nav-group-btn{
-      display:flex;align-items:center;gap:9;width:100%;
+      display:flex;align-items:center;gap:9px;width:100%;
       padding:9px 12px;border:none;border-radius:12;
       background:transparent;color:${C.muted};
       font-size:13;font-weight:500;cursor:pointer;
