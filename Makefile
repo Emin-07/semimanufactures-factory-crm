@@ -1,4 +1,4 @@
-.PHONY: env install dev build db db-stop db-shell docker-up docker-down docker-build logs clean setup help
+.PHONY: env install dev build db db-stop db-shell docker-up docker-down docker-build logs clean setup backup backup-local help
 
 # ── Первичная настройка ────────────────────────────────────────────
 ## Скопировать .env.example → .env (не перезаписывает если уже есть)
@@ -57,6 +57,17 @@ docker-build:
 logs:
 	docker compose logs -f app
 
+# ── Резервные копии ────────────────────────────────────────────
+## Бэкап БД через Docker (для локальной разработки)
+backup-local:
+	@mkdir -p backups
+	docker compose exec db pg_dump -U dikanish dikanish | gzip > backups/backup_$(shell date +%Y%m%d_%H%M%S).sql.gz
+	@echo "Готово: backups/backup_$(shell date +%Y%m%d_%H%M%S).sql.gz"
+
+## Бэкап через pg_dump (для VPS с DATABASE_URL в .env)
+backup:
+	@bash scripts/backup.sh
+
 # ── Прочее ─────────────────────────────────────────────────────────
 ## Удалить dist/ и node_modules/
 clean:
@@ -76,5 +87,7 @@ help:
 	@echo "  make docker-up    — поднять весь стек через Docker"
 	@echo "  make docker-down  — остановить Docker-стек"
 	@echo "  make logs         — логи app-контейнера"
+	@echo "  make backup-local — бэкап БД через Docker (локально)"
+	@echo "  make backup       — бэкап БД через pg_dump (.env / VPS)"
 	@echo "  make clean        — удалить dist/ и node_modules/"
 	@echo ""

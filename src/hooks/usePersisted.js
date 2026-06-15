@@ -68,6 +68,8 @@ export function usePersisted(key, init) {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: serialized,
+        retries: 3,
+        retryDelay: 1000,
       })
         .then(r => {
           if (r && !r.ok) {

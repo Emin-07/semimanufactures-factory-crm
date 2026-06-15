@@ -158,7 +158,32 @@ make db-shell     — psql внутри контейнера
 make docker-up    — поднять весь стек через Docker
 make docker-down  — остановить Docker-стек
 make logs         — логи app-контейнера
+make backup-local — бэкап БД через Docker (локально)
+make backup       — бэкап БД через pg_dump (.env / VPS)
 make clean        — удалить dist/ и node_modules/
+```
+
+---
+
+### Резервные копии БД
+
+Бэкапы хранятся в `backups/` (сжатые `.sql.gz`), старше 7 дней удаляются автоматически.
+
+**Локально (Docker):**
+```bash
+make backup-local
+```
+
+**На VPS — настроить cron:**
+```bash
+crontab -e
+# Добавить (бэкап каждую ночь в 03:00):
+0 3 * * * /var/www/dikanish/scripts/backup.sh >> /var/www/dikanish/backups/backup.log 2>&1
+```
+
+**Восстановление:**
+```bash
+gunzip -c backups/backup_20260601_030000.sql.gz | psql "$DATABASE_URL"
 ```
 
 ---

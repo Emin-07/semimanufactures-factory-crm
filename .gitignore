@@ -18,6 +18,9 @@ dist-ssr
 # Backend data (SQLite database)
 /data/
 
+# Database backups (generated, not for git)
+/backups/
+
 # Editor directories and files
 .vscode/*
 !.vscode/extensions.json
