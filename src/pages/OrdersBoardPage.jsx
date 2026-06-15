@@ -6,6 +6,29 @@ import { fmtDate, fmtShort, fmtTime, daysBetween, relTime } from "../utils/dates
 import { C, CC } from "../theme/colors.js";
 import { I } from "../icons/Icons.jsx";
 import { EthnicBorder, EthnicCorner, Badge, Btn, Inp, Sel, Txa, Modal, Confirm, Stat, Toast, TH, TD, Card, Title, PageH, SearchBox } from "../components/ui/index.jsx";
+import { INIT_PRODUCTS, INIT_CLIENTS } from "../data/initState.js";
+
+function fmtElapsed(refTime, now) {
+  const min = Math.floor((now - new Date(refTime).getTime()) / 60000);
+  if (min < 60) return `${min}м`;
+  const h = Math.floor(min / 60);
+  const m = min % 60;
+  return m > 0 ? `${h}ч ${m}м` : `${h}ч`;
+}
+
+function elapsedColor(refTime, now) {
+  const min = (now - new Date(refTime).getTime()) / 60000;
+  if (min < 30) return "#52C97A";
+  if (min < 90) return "#E8A838";
+  return "#E85050";
+}
+
+const BOARD_COL_COLORS = {
+  "новый":          { bg: "rgba(30,25,18,0.9)", border: "rgba(91,141,181,0.25)",  dot: "#5B8DB5", title: "#5B8DB5" },
+  "сборка":         { bg: "rgba(30,25,18,0.9)", border: "rgba(212,130,58,0.25)", dot: "#D4823A", title: "#D4823A" },
+  "в производстве": { bg: "rgba(30,25,18,0.9)", border: "rgba(200,150,62,0.25)", dot: "#C8963E", title: "#C8963E" },
+  "готов":          { bg: "rgba(18,35,22,0.9)", border: "rgba(90,158,95,0.3)",   dot: "#5A9E5F", title: "#5A9E5F" },
+};
 
 const BoardOrderCard=({order,clients,products,now})=>{
   const client=clients.find(c=>c.id===order.clientId);

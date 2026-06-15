@@ -1,5 +1,5 @@
 import express from "express";
-import Database from "better-sqlite3";
+import pg from "pg";
 import jwt from "jsonwebtoken";
 import { fileURLToPath } from "url";
 import { dirname, join } from "path";
@@ -10,22 +10,33 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 const PORT = process.env.PORT || 3000;
 
 // ── Database ──
-const dataDir = join(__dirname, "data");
-if (!fs.existsSync(dataDir)) fs.mkdirSync(dataDir, { recursive: true });
+const { Pool } = pg;
+const pool = new Pool({ connectionString: process.env.DATABASE_URL });
 
-const db = new Database(join(dataDir, "dikanish.sqlite"));
-db.exec(`
-  CREATE TABLE IF NOT EXISTS state (
-    key TEXT PRIMARY KEY,
-    value TEXT NOT NULL,
-    updated_at INTEGER DEFAULT (unixepoch())
-  );
-  CREATE TABLE IF NOT EXISTS state_log (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    key TEXT NOT NULL,
-    updated_at INTEGER DEFAULT (unixepoch())
-  );
-`);
+async function initDb() {
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS state (
+      key TEXT PRIMARY KEY,
+      value TEXT NOT NULL,
+      updated_at INTEGER DEFAULT EXTRACT(EPOCH FROM NOW())::INTEGER
+    )
+  `);
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS state_log (
+      id BIGSERIAL PRIMARY KEY,
+      key TEXT NOT NULL,
+      updated_at INTEGER DEFAULT EXTRACT(EPOCH FROM NOW())::INTEGER
+    )
+  `);
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS refresh_tokens (
+      id TEXT PRIMARY KEY,
+      user_id INTEGER NOT NULL,
+      expires_at INTEGER NOT NULL
+    )
+  `);
+  await pool.query("DELETE FROM refresh_tokens WHERE expires_at < EXTRACT(EPOCH FROM NOW())::INTEGER");
+}
 
 // ── Password helpers ──
 // New format: "pbkdf2:<salt>:<hash>"
@@ -136,16 +147,6 @@ function getCookie(req, name) {
   return null;
 }
 
-// Refresh token table (for revocation on logout)
-db.exec(`
-  CREATE TABLE IF NOT EXISTS refresh_tokens (
-    id         TEXT    PRIMARY KEY,
-    user_id    INTEGER NOT NULL,
-    expires_at INTEGER NOT NULL
-  );
-`);
-db.prepare("DELETE FROM refresh_tokens WHERE expires_at < unixepoch()").run();
-
 // JWT middleware — parses access_token cookie and sets req.user if valid
 app.use((req, _res, next) => {
   const token = getCookie(req, "access_token");
@@ -209,15 +210,14 @@ function checkKeyAccess(req, res, next) {
 // ── AUTH ENDPOINTS ──
 
 // POST /api/auth/login
-app.post("/api/auth/login", (req, res) => {
+app.post("/api/auth/login", async (req, res) => {
   try {
     const { email, password } = req.body;
     if (!email || !password) return res.status(400).json({ error: "Укажите email и пароль" });
 
-    const row = db.prepare("SELECT value FROM state WHERE key = 'dk_users'").get();
-    if (!row) return res.status(401).json({ error: "Пользователи не найдены" });
+    const users = await readState("dk_users");
+    if (!users) return res.status(401).json({ error: "Пользователи не найдены" });
 
-    const users = JSON.parse(row.value);
     const user = users.find(u => u.email === email);
     if (!user) return res.status(401).json({ error: "Неверный email или пароль" });
     if (user.status === "blocked") return res.status(403).json({ error: "Аккаунт заблокирован" });
@@ -227,7 +227,10 @@ app.post("/api/auth/login", (req, res) => {
     if (!user.password.startsWith("pbkdf2:")) {
       const newHash = hashPassword(password);
       const updated = users.map(u => u.id === user.id ? { ...u, password: newHash } : u);
-      db.prepare("UPDATE state SET value = ?, updated_at = unixepoch() WHERE key = 'dk_users'").run(JSON.stringify(updated));
+      await pool.query(
+        "UPDATE state SET value = $1, updated_at = EXTRACT(EPOCH FROM NOW())::INTEGER WHERE key = 'dk_users'",
+        [JSON.stringify(updated)]
+      );
     }
 
     // Issue access token (15 min) and refresh token (30 days)
@@ -235,7 +238,10 @@ app.post("/api/auth/login", (req, res) => {
     const jti = randomUUID();
     const refreshExpiresAt = Math.floor(Date.now() / 1000) + 30 * 24 * 60 * 60;
     const refreshToken = jwt.sign({ userId: user.id, roleId: user.roleId, jti }, REFRESH_SECRET, { expiresIn: "30d" });
-    db.prepare("INSERT INTO refresh_tokens (id, user_id, expires_at) VALUES (?, ?, ?)").run(jti, user.id, refreshExpiresAt);
+    await pool.query(
+      "INSERT INTO refresh_tokens (id, user_id, expires_at) VALUES ($1, $2, $3)",
+      [jti, user.id, refreshExpiresAt]
+    );
 
     res.cookie("access_token",  accessToken,  ACCESS_COOKIE_OPTS);
     res.cookie("refresh_token", refreshToken, REFRESH_COOKIE_OPTS);
@@ -249,12 +255,12 @@ app.post("/api/auth/login", (req, res) => {
 });
 
 // POST /api/auth/logout
-app.post("/api/auth/logout", (req, res) => {
+app.post("/api/auth/logout", async (req, res) => {
   const token = getCookie(req, "refresh_token");
   if (token) {
     try {
       const payload = jwt.verify(token, REFRESH_SECRET);
-      db.prepare("DELETE FROM refresh_tokens WHERE id = ?").run(payload.jti);
+      await pool.query("DELETE FROM refresh_tokens WHERE id = $1", [payload.jti]);
     } catch {}
   }
   res.clearCookie("access_token");
@@ -263,9 +269,9 @@ app.post("/api/auth/logout", (req, res) => {
 });
 
 // GET /api/auth/me — returns current user; silently refreshes access token if needed
-app.get("/api/auth/me", (req, res) => {
+app.get("/api/auth/me", async (req, res) => {
   try {
-    const users = readState("dk_users") || [];
+    const users = await readState("dk_users") || [];
 
     // Fast path: valid access token already parsed by middleware
     if (req.user) {
@@ -285,7 +291,7 @@ app.get("/api/auth/me", (req, res) => {
     const refreshRaw = getCookie(req, "refresh_token");
     if (refreshRaw) {
       const payload = jwt.verify(refreshRaw, REFRESH_SECRET); // throws if invalid/expired
-      const stored = db.prepare("SELECT * FROM refresh_tokens WHERE id = ?").get(payload.jti);
+      const stored = (await pool.query("SELECT * FROM refresh_tokens WHERE id = $1", [payload.jti])).rows[0];
       if (!stored) return res.status(401).json({ error: "Сессия истекла" });
       const user = users.find(u => u.id === payload.userId);
       if (!user) return res.status(401).json({ error: "Пользователь не найден" });
@@ -304,17 +310,17 @@ app.get("/api/auth/me", (req, res) => {
 });
 
 // POST /api/auth/refresh — issue new access token using refresh token cookie
-app.post("/api/auth/refresh", (req, res) => {
+app.post("/api/auth/refresh", async (req, res) => {
   const token = getCookie(req, "refresh_token");
   if (!token) return res.status(401).json({ error: "Нет refresh токена" });
   try {
     const payload = jwt.verify(token, REFRESH_SECRET);
-    const stored = db.prepare("SELECT * FROM refresh_tokens WHERE id = ?").get(payload.jti);
+    const stored = (await pool.query("SELECT * FROM refresh_tokens WHERE id = $1", [payload.jti])).rows[0];
     if (!stored) return res.status(401).json({ error: "Refresh токен отозван" });
-    const users = readState("dk_users") || [];
+    const users = await readState("dk_users") || [];
     const user = users.find(u => u.id === payload.userId);
     if (!user || user.status === "blocked") {
-      db.prepare("DELETE FROM refresh_tokens WHERE id = ?").run(payload.jti);
+      await pool.query("DELETE FROM refresh_tokens WHERE id = $1", [payload.jti]);
       return res.status(401).json({ error: "Пользователь недоступен" });
     }
     const newAccess = jwt.sign({ userId: user.id, roleId: user.roleId }, ACCESS_SECRET, { expiresIn: "15m" });
@@ -326,7 +332,7 @@ app.post("/api/auth/refresh", (req, res) => {
 });
 
 // POST /api/auth/change-password — admin only
-app.post("/api/auth/change-password", requireAuth, (req, res) => {
+app.post("/api/auth/change-password", requireAuth, async (req, res) => {
   if (roleLevel(req.user.roleId) !== "admin") {
     return res.status(403).json({ error: "Только для администратора" });
   }
@@ -335,13 +341,15 @@ app.post("/api/auth/change-password", requireAuth, (req, res) => {
     if (!userId || !newPassword || newPassword.length < 4) {
       return res.status(400).json({ error: "Укажите userId и пароль (мин. 4 символа)" });
     }
-    const row = db.prepare("SELECT value FROM state WHERE key = 'dk_users'").get();
-    if (!row) return res.status(404).json({ error: "Пользователи не найдены" });
-    const users = JSON.parse(row.value);
+    const users = await readState("dk_users");
+    if (!users) return res.status(404).json({ error: "Пользователи не найдены" });
     const idx = users.findIndex(u => u.id === userId);
     if (idx === -1) return res.status(404).json({ error: "Пользователь не найден" });
     users[idx].password = hashPassword(newPassword);
-    db.prepare("UPDATE state SET value = ?, updated_at = unixepoch() WHERE key = 'dk_users'").run(JSON.stringify(users));
+    await pool.query(
+      "UPDATE state SET value = $1, updated_at = EXTRACT(EPOCH FROM NOW())::INTEGER WHERE key = 'dk_users'",
+      [JSON.stringify(users)]
+    );
     res.json({ ok: true });
   } catch (e) {
     res.status(500).json({ error: e.message });
@@ -349,16 +357,34 @@ app.post("/api/auth/change-password", requireAuth, (req, res) => {
 });
 
 // ── DB helpers ──
-function readState(key) {
-  const row = db.prepare("SELECT value FROM state WHERE key = ?").get(key);
-  return row ? JSON.parse(row.value) : null;
+async function readState(key, client = pool) {
+  const result = await client.query("SELECT value FROM state WHERE key = $1", [key]);
+  return result.rows[0] ? JSON.parse(result.rows[0].value) : null;
 }
-function writeState(key, value) {
-  db.prepare(`
-    INSERT INTO state (key, value, updated_at) VALUES (?, ?, unixepoch())
-    ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = unixepoch()
-  `).run(key, JSON.stringify(value));
-  db.prepare("INSERT INTO state_log (key) VALUES (?)").run(key);
+
+async function writeState(key, value, client = pool) {
+  await client.query(
+    `INSERT INTO state (key, value, updated_at)
+     VALUES ($1, $2, EXTRACT(EPOCH FROM NOW())::INTEGER)
+     ON CONFLICT(key) DO UPDATE SET value = EXCLUDED.value, updated_at = EXTRACT(EPOCH FROM NOW())::INTEGER`,
+    [key, JSON.stringify(value)]
+  );
+  await client.query("INSERT INTO state_log (key) VALUES ($1)", [key]);
+}
+
+async function withTransaction(fn) {
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    const result = await fn(client);
+    await client.query("COMMIT");
+    return result;
+  } catch (e) {
+    await client.query("ROLLBACK");
+    throw e;
+  } finally {
+    client.release();
+  }
 }
 
 // ── Server-side applyOutput (mirrors frontend applyOutput logic) ──
@@ -420,7 +446,7 @@ function serverApplyOutput(state, out) {
 // POST /api/actions/task-complete
 // Any authenticated user assigned to the task can complete it.
 // Workers: must be in task.userIds. Manager/admin: any task.
-app.post("/api/actions/task-complete", requireAuth, (req, res) => {
+app.post("/api/actions/task-complete", requireAuth, async (req, res) => {
   const { taskId, quantities } = req.body;
   // quantities: { [userId: string]: number }
   if (!taskId || !quantities || typeof quantities !== "object") {
@@ -428,11 +454,11 @@ app.post("/api/actions/task-complete", requireAuth, (req, res) => {
   }
 
   try {
-    const result = db.transaction(() => {
-      const tasks = readState("dk_tasks") || [];
-      const taskEmps = readState("dk_task_emps") || [];
-      const prodOutputs = readState("dk_prod_outputs") || [];
-      const batches = readState("dk_batches") || [];
+    const result = await withTransaction(async (client) => {
+      const tasks = await readState("dk_tasks", client) || [];
+      const taskEmps = await readState("dk_task_emps", client) || [];
+      const prodOutputs = await readState("dk_prod_outputs", client) || [];
+      const batches = await readState("dk_batches", client) || [];
 
       // Validate task
       const task = tasks.find(t => t.id === taskId);
@@ -491,13 +517,13 @@ app.post("/api/actions/task-complete", requireAuth, (req, res) => {
       const newOutputs = [];
       let firstWorker = true;
       let state = {
-        dk_products:       readState("dk_products")       || [],
-        dk_inv_move:       readState("dk_inv_move")       || [],
-        dk_raw_mats:       readState("dk_raw_mats")       || [],
-        dk_raw_movements:  readState("dk_raw_movements")  || [],
-        dk_emp_hist:       readState("dk_emp_hist")       || [],
-        dk_prod_plans:     readState("dk_prod_plans")     || [],
-        dk_recipes:        readState("dk_recipes")        || [],
+        dk_products:       await readState("dk_products", client)       || [],
+        dk_inv_move:       await readState("dk_inv_move", client)       || [],
+        dk_raw_mats:       await readState("dk_raw_mats", client)       || [],
+        dk_raw_movements:  await readState("dk_raw_movements", client)  || [],
+        dk_emp_hist:       await readState("dk_emp_hist", client)       || [],
+        dk_prod_plans:     await readState("dk_prod_plans", client)     || [],
+        dk_recipes:        await readState("dk_recipes", client)        || [],
       };
 
       for (const [uid, qty] of qEntries) {
@@ -514,7 +540,7 @@ app.post("/api/actions/task-complete", requireAuth, (req, res) => {
       }
 
       // Notifications and log
-      const users = readState("dk_users") || [];
+      const users = await readState("dk_users", client) || [];
       const product = state.dk_products.find(p => p.id === task.productId) || {};
       const actor = users.find(u => u.id === req.user.userId);
       const actorName = actor?.name?.split(" ").slice(0, 2).join(" ") || "Работник";
@@ -522,8 +548,8 @@ app.post("/api/actions/task-complete", requireAuth, (req, res) => {
         users.find(u => u.id === uid)?.name?.split(" ").slice(0, 2).join(" ") || "?"
       ).join(", ");
 
-      const notifications = readState("dk_notifications") || [];
-      const logs = readState("dk_logs") || [];
+      const notifications = await readState("dk_notifications", client) || [];
+      const logs = await readState("dk_logs", client) || [];
       const newNotif = {
         id: Date.now() + Math.random(),
         title: `Задание ${isLate ? "просрочено" : "выполнено"}: ${product.name || ""}`,
@@ -544,18 +570,18 @@ app.post("/api/actions/task-complete", requireAuth, (req, res) => {
       const finalLogs = [...logs, newLog];
 
       // Write all atomically
-      writeState("dk_tasks",         updatedTasks);
-      writeState("dk_task_emps",     updatedTaskEmps);
-      writeState("dk_prod_outputs",  finalOutputs);
-      writeState("dk_batches",       finalBatches);
-      writeState("dk_products",      state.dk_products);
-      writeState("dk_inv_move",      state.dk_inv_move);
-      writeState("dk_raw_mats",      state.dk_raw_mats);
-      writeState("dk_raw_movements", state.dk_raw_movements);
-      writeState("dk_emp_hist",      state.dk_emp_hist);
-      writeState("dk_prod_plans",    state.dk_prod_plans);
-      writeState("dk_notifications", finalNotifs);
-      writeState("dk_logs",          finalLogs);
+      await writeState("dk_tasks",         updatedTasks,          client);
+      await writeState("dk_task_emps",     updatedTaskEmps,       client);
+      await writeState("dk_prod_outputs",  finalOutputs,          client);
+      await writeState("dk_batches",       finalBatches,          client);
+      await writeState("dk_products",      state.dk_products,     client);
+      await writeState("dk_inv_move",      state.dk_inv_move,     client);
+      await writeState("dk_raw_mats",      state.dk_raw_mats,     client);
+      await writeState("dk_raw_movements", state.dk_raw_movements,client);
+      await writeState("dk_emp_hist",      state.dk_emp_hist,     client);
+      await writeState("dk_prod_plans",    state.dk_prod_plans,   client);
+      await writeState("dk_notifications", finalNotifs,           client);
+      await writeState("dk_logs",          finalLogs,             client);
 
       return {
         dk_tasks:         updatedTasks,
@@ -569,7 +595,7 @@ app.post("/api/actions/task-complete", requireAuth, (req, res) => {
         dk_notifications: finalNotifs,
         dk_logs:          finalLogs,
       };
-    })();
+    });
 
     res.json({ ok: true, state: result });
   } catch (e) {
@@ -582,7 +608,7 @@ app.post("/api/actions/task-complete", requireAuth, (req, res) => {
 // POST /api/actions/output-record
 // Record a manual production output.
 // Workers: can only record for themselves (employeeId enforced server-side).
-app.post("/api/actions/output-record", requireAuth, (req, res) => {
+app.post("/api/actions/output-record", requireAuth, async (req, res) => {
   const { productId, employeeId, quantity, date, comment } = req.body;
   if (!productId || !employeeId || !quantity || +quantity <= 0) {
     return res.status(400).json({ error: "Укажите productId, employeeId, quantity > 0" });
@@ -595,7 +621,7 @@ app.post("/api/actions/output-record", requireAuth, (req, res) => {
   }
 
   try {
-    const result = db.transaction(() => {
+    const result = await withTransaction(async (client) => {
       const now = new Date().toISOString();
       const id = Date.now() + Math.random();
       const batchId = id + 0.5;
@@ -614,21 +640,21 @@ app.post("/api/actions/output-record", requireAuth, (req, res) => {
       };
 
       let state = {
-        dk_products:       readState("dk_products")       || [],
-        dk_inv_move:       readState("dk_inv_move")       || [],
-        dk_raw_mats:       readState("dk_raw_mats")       || [],
-        dk_raw_movements:  readState("dk_raw_movements")  || [],
-        dk_emp_hist:       readState("dk_emp_hist")       || [],
-        dk_prod_plans:     readState("dk_prod_plans")     || [],
-        dk_recipes:        readState("dk_recipes")        || [],
+        dk_products:       await readState("dk_products", client)       || [],
+        dk_inv_move:       await readState("dk_inv_move", client)       || [],
+        dk_raw_mats:       await readState("dk_raw_mats", client)       || [],
+        dk_raw_movements:  await readState("dk_raw_movements", client)  || [],
+        dk_emp_hist:       await readState("dk_emp_hist", client)       || [],
+        dk_prod_plans:     await readState("dk_prod_plans", client)     || [],
+        dk_recipes:        await readState("dk_recipes", client)        || [],
       };
       state = serverApplyOutput(state, out);
 
-      const prodOutputs = readState("dk_prod_outputs") || [];
-      const batches     = readState("dk_batches")      || [];
-      const users       = readState("dk_users")        || [];
-      const notifications = readState("dk_notifications") || [];
-      const logs        = readState("dk_logs")         || [];
+      const prodOutputs    = await readState("dk_prod_outputs", client)   || [];
+      const batches        = await readState("dk_batches", client)        || [];
+      const users          = await readState("dk_users", client)          || [];
+      const notifications  = await readState("dk_notifications", client)  || [];
+      const logs           = await readState("dk_logs", client)           || [];
 
       const product  = state.dk_products.find(p => p.id === +productId) || {};
       const actor    = users.find(u => u.id === req.user.userId);
@@ -652,16 +678,16 @@ app.post("/api/actions/output-record", requireAuth, (req, res) => {
       const finalNotifs  = [...notifications, newNotif];
       const finalLogs    = [...logs, newLog];
 
-      writeState("dk_prod_outputs",  finalOutputs);
-      writeState("dk_batches",       finalBatches);
-      writeState("dk_products",      state.dk_products);
-      writeState("dk_inv_move",      state.dk_inv_move);
-      writeState("dk_raw_mats",      state.dk_raw_mats);
-      writeState("dk_raw_movements", state.dk_raw_movements);
-      writeState("dk_emp_hist",      state.dk_emp_hist);
-      writeState("dk_prod_plans",    state.dk_prod_plans);
-      writeState("dk_notifications", finalNotifs);
-      writeState("dk_logs",          finalLogs);
+      await writeState("dk_prod_outputs",  finalOutputs,          client);
+      await writeState("dk_batches",       finalBatches,          client);
+      await writeState("dk_products",      state.dk_products,     client);
+      await writeState("dk_inv_move",      state.dk_inv_move,     client);
+      await writeState("dk_raw_mats",      state.dk_raw_mats,     client);
+      await writeState("dk_raw_movements", state.dk_raw_movements,client);
+      await writeState("dk_emp_hist",      state.dk_emp_hist,     client);
+      await writeState("dk_prod_plans",    state.dk_prod_plans,   client);
+      await writeState("dk_notifications", finalNotifs,           client);
+      await writeState("dk_logs",          finalLogs,             client);
 
       return {
         dk_prod_outputs:  finalOutputs,
@@ -673,7 +699,7 @@ app.post("/api/actions/output-record", requireAuth, (req, res) => {
         dk_notifications: finalNotifs,
         dk_logs:          finalLogs,
       };
-    })();
+    });
 
     res.json({ ok: true, state: result });
   } catch (e) {
@@ -687,14 +713,14 @@ app.post("/api/actions/output-record", requireAuth, (req, res) => {
 // Any authenticated user can mark a notification as read for themselves.
 // This is the safe path for workers — they no longer need write access
 // to dk_notifications to toggle their own readBy entry.
-app.post("/api/actions/notifications/read", requireAuth, (req, res) => {
+app.post("/api/actions/notifications/read", requireAuth, async (req, res) => {
   const { notificationId } = req.body || {};
   if (notificationId == null) {
     return res.status(400).json({ error: "Укажите notificationId" });
   }
   try {
-    const result = db.transaction(() => {
-      const list = readState("dk_notifications") || [];
+    const result = await withTransaction(async (client) => {
+      const list = await readState("dk_notifications", client) || [];
       const uid = req.user.userId;
       let changed = false;
       const updated = list.map(n => {
@@ -704,9 +730,9 @@ app.post("/api/actions/notifications/read", requireAuth, (req, res) => {
         changed = true;
         return { ...n, readBy: [...readBy, uid] };
       });
-      if (changed) writeState("dk_notifications", updated);
+      if (changed) await writeState("dk_notifications", updated, client);
       return updated;
-    })();
+    });
     res.json({ ok: true, dk_notifications: result });
   } catch (e) {
     console.error("[notifications/read]", e);
@@ -716,10 +742,10 @@ app.post("/api/actions/notifications/read", requireAuth, (req, res) => {
 
 // POST /api/actions/notifications/read-all
 // Mark every notification targeting this user as read.
-app.post("/api/actions/notifications/read-all", requireAuth, (req, res) => {
+app.post("/api/actions/notifications/read-all", requireAuth, async (req, res) => {
   try {
-    const result = db.transaction(() => {
-      const list = readState("dk_notifications") || [];
+    const result = await withTransaction(async (client) => {
+      const list = await readState("dk_notifications", client) || [];
       const uid = req.user.userId;
       let changed = false;
       const updated = list.map(n => {
@@ -730,9 +756,9 @@ app.post("/api/actions/notifications/read-all", requireAuth, (req, res) => {
         changed = true;
         return { ...n, readBy: [...readBy, uid] };
       });
-      if (changed) writeState("dk_notifications", updated);
+      if (changed) await writeState("dk_notifications", updated, client);
       return updated;
-    })();
+    });
     res.json({ ok: true, dk_notifications: result });
   } catch (e) {
     console.error("[notifications/read-all]", e);
@@ -744,15 +770,15 @@ app.post("/api/actions/notifications/read-all", requireAuth, (req, res) => {
 // Append-only audit log. Any authenticated user can write their own entry.
 // The userId/userName are enforced server-side from the session — client
 // cannot forge identity. Fire-and-forget from the client side.
-app.post("/api/actions/log", requireAuth, (req, res) => {
+app.post("/api/actions/log", requireAuth, async (req, res) => {
   const { message } = req.body || {};
   if (!message || typeof message !== "string") {
     return res.status(400).json({ error: "Укажите message" });
   }
   try {
-    db.transaction(() => {
-      const logs = readState("dk_logs") || [];
-      const users = readState("dk_users") || [];
+    await withTransaction(async (client) => {
+      const logs = await readState("dk_logs", client) || [];
+      const users = await readState("dk_users", client) || [];
       const actor = users.find(u => u.id === req.user.userId);
       const actorName = actor?.name?.split(" ").slice(0, 2).join(" ") || "Пользователь";
       const entry = {
@@ -762,8 +788,8 @@ app.post("/api/actions/log", requireAuth, (req, res) => {
         message: message.slice(0, 500),
         date: new Date().toISOString(),
       };
-      writeState("dk_logs", [...logs, entry]);
-    })();
+      await writeState("dk_logs", [...logs, entry], client);
+    });
     res.json({ ok: true });
   } catch (e) {
     console.error("[actions/log]", e);
@@ -774,13 +800,13 @@ app.post("/api/actions/log", requireAuth, (req, res) => {
 // POST /api/actions/task-start
 // Worker or manager starts a task. Worker must be assigned to the task.
 // Updates task.status → "в работе" and sets startedAt.
-app.post("/api/actions/task-start", requireAuth, (req, res) => {
+app.post("/api/actions/task-start", requireAuth, async (req, res) => {
   const { taskId } = req.body || {};
   if (taskId == null) return res.status(400).json({ error: "Укажите taskId" });
   try {
-    const result = db.transaction(() => {
-      const tasks = readState("dk_tasks") || [];
-      const taskEmps = readState("dk_task_emps") || [];
+    const result = await withTransaction(async (client) => {
+      const tasks = await readState("dk_tasks", client) || [];
+      const taskEmps = await readState("dk_task_emps", client) || [];
       const task = tasks.find(t => t.id === taskId);
       if (!task) throw { status: 404, message: "Задание не найдено" };
       if (task.status === "завершено" || task.status === "просрочено") {
@@ -804,11 +830,11 @@ app.post("/api/actions/task-start", requireAuth, (req, res) => {
           : te
       );
 
-      const users = readState("dk_users") || [];
-      const logs = readState("dk_logs") || [];
+      const users = await readState("dk_users", client) || [];
+      const logs = await readState("dk_logs", client) || [];
       const actor = users.find(u => u.id === req.user.userId);
       const actorName = actor?.name?.split(" ").slice(0, 2).join(" ") || "Работник";
-      const products = readState("dk_products") || [];
+      const products = await readState("dk_products", client) || [];
       const product = products.find(p => p.id === task.productId) || {};
       const newLog = {
         id: Date.now() + Math.random(),
@@ -818,16 +844,16 @@ app.post("/api/actions/task-start", requireAuth, (req, res) => {
         date: now,
       };
 
-      writeState("dk_tasks", updatedTasks);
-      writeState("dk_task_emps", updatedTaskEmps);
-      writeState("dk_logs", [...logs, newLog]);
+      await writeState("dk_tasks",    updatedTasks,          client);
+      await writeState("dk_task_emps",updatedTaskEmps,       client);
+      await writeState("dk_logs",     [...logs, newLog],     client);
 
       return {
         dk_tasks: updatedTasks,
         dk_task_emps: updatedTaskEmps,
         dk_logs: [...logs, newLog],
       };
-    })();
+    });
     res.json({ ok: true, state: result });
   } catch (e) {
     if (e.status) return res.status(e.status).json({ error: e.message });
@@ -840,7 +866,7 @@ app.post("/api/actions/task-start", requireAuth, (req, res) => {
 // Worker marks their own attendance. Manager/admin can mark anyone.
 // Mirrors the existing dk_marks schema (append-only events with type/time).
 const ATTENDANCE_TYPES = ["приход", "уход", "опоздание", "отсутствие"];
-app.post("/api/actions/attendance-mark", requireAuth, (req, res) => {
+app.post("/api/actions/attendance-mark", requireAuth, async (req, res) => {
   const { employeeId, type, time, reason, comment } = req.body || {};
   const eid = +employeeId;
   if (!eid || !type) {
@@ -854,8 +880,8 @@ app.post("/api/actions/attendance-mark", requireAuth, (req, res) => {
     return res.status(403).json({ error: "Вы можете отметить только себя" });
   }
   try {
-    const result = db.transaction(() => {
-      const marks = readState("dk_marks") || [];
+    const result = await withTransaction(async (client) => {
+      const marks = await readState("dk_marks", client) || [];
       const now = new Date().toISOString();
       const when = time ? new Date(time).toISOString() : now;
       const entry = {
@@ -870,8 +896,8 @@ app.post("/api/actions/attendance-mark", requireAuth, (req, res) => {
       };
       const updated = [...marks, entry];
 
-      const users = readState("dk_users") || [];
-      const logs = readState("dk_logs") || [];
+      const users = await readState("dk_users", client) || [];
+      const logs = await readState("dk_logs", client) || [];
       const actor = users.find(u => u.id === req.user.userId);
       const actorName = actor?.name?.split(" ").slice(0, 2).join(" ") || "Работник";
       const target = users.find(u => u.id === eid);
@@ -884,11 +910,11 @@ app.post("/api/actions/attendance-mark", requireAuth, (req, res) => {
         date: now,
       };
 
-      writeState("dk_marks", updated);
-      writeState("dk_logs", [...logs, newLog]);
+      await writeState("dk_marks", updated,           client);
+      await writeState("dk_logs",  [...logs, newLog], client);
 
       return { dk_marks: updated, dk_logs: [...logs, newLog] };
-    })();
+    });
     res.json({ ok: true, state: result });
   } catch (e) {
     if (e.status) return res.status(e.status).json({ error: e.message });
@@ -927,9 +953,9 @@ function toBoardProductDTO(p) {
   };
 }
 
-app.get("/api/board/orders", (_req, res) => {
+app.get("/api/board/orders", async (_req, res) => {
   try {
-    const orders = readState("dk_client_orders") || [];
+    const orders = await readState("dk_client_orders") || [];
     const active = orders
       .filter(o => !["отгружен", "отменён"].includes(o.status))
       .map(toBoardOrderDTO);
@@ -939,9 +965,9 @@ app.get("/api/board/orders", (_req, res) => {
   }
 });
 
-app.get("/api/board/products", (_req, res) => {
+app.get("/api/board/products", async (_req, res) => {
   try {
-    const products = readState("dk_products") || [];
+    const products = await readState("dk_products") || [];
     const visible = products
       .filter(p => !p.deleted)
       .map(toBoardProductDTO);
@@ -953,12 +979,12 @@ app.get("/api/board/products", (_req, res) => {
 
 // ── STATE ENDPOINTS (protected) ──
 
-app.get("/api/state/:key", checkKeyAccess, (req, res) => {
+app.get("/api/state/:key", checkKeyAccess, async (req, res) => {
   try {
-    const row = db.prepare("SELECT value FROM state WHERE key = ?").get(req.params.key);
-    if (!row) return res.status(404).json(null);
+    const qr = await pool.query("SELECT value FROM state WHERE key = $1", [req.params.key]);
+    if (!qr.rows[0]) return res.status(404).json(null);
 
-    let data = JSON.parse(row.value);
+    let data = JSON.parse(qr.rows[0].value);
 
     // Strip password from dk_users for non-admin readers
     if (req._stripPasswords && Array.isArray(data)) {
@@ -971,14 +997,9 @@ app.get("/api/state/:key", checkKeyAccess, (req, res) => {
   }
 });
 
-app.post("/api/state/:key", checkKeyAccess, (req, res) => {
+app.post("/api/state/:key", checkKeyAccess, async (req, res) => {
   try {
-    const value = JSON.stringify(req.body);
-    db.prepare(`
-      INSERT INTO state (key, value, updated_at) VALUES (?, ?, unixepoch())
-      ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = unixepoch()
-    `).run(req.params.key, value);
-    db.prepare("INSERT INTO state_log (key) VALUES (?)").run(req.params.key);
+    await writeState(req.params.key, req.body);
     res.json({ ok: true });
   } catch (e) {
     res.status(500).json({ error: e.message });
@@ -986,14 +1007,18 @@ app.post("/api/state/:key", checkKeyAccess, (req, res) => {
 });
 
 // ── UPDATES POLLING (requires auth or board mode) ──
-app.get("/api/updates", (req, res) => {
+app.get("/api/updates", async (req, res) => {
   if (!req.user && !isBoardRequest(req)) {
     return res.status(401).json([]);
   }
   try {
     const sinceRaw = parseInt(req.query.since) || 0;
     const since = sinceRaw > 1e10 ? Math.floor(sinceRaw / 1000) : sinceRaw;
-    const rows = db.prepare("SELECT key, MAX(updated_at) as ts FROM state WHERE updated_at > ? GROUP BY key").all(since);
+    const qr = await pool.query(
+      "SELECT key, MAX(updated_at) as ts FROM state WHERE updated_at > $1 GROUP BY key",
+      [since]
+    );
+    const rows = qr.rows;
 
     const roleId = req.user?.roleId;
     const filtered = rows.filter(row => {
@@ -1026,14 +1051,14 @@ function sanitizeUser(u) {
 }
 
 // POST /api/admin/users — create user
-app.post("/api/admin/users", requireAdmin, (req, res) => {
+app.post("/api/admin/users", requireAdmin, async (req, res) => {
   try {
     const { firstName, lastName, email, password, roleId, jobTitle, payType, dailyNorm, pieceRate, fixedDayRate, comment, birthDate, phone, experienceYears, experienceMonths, noExperience } = req.body;
     if (!email || !password || password.length < 4) return res.status(400).json({ error: "email и пароль (мин. 4 символа) обязательны" });
     if (!firstName && !lastName && !req.body.name) return res.status(400).json({ error: "Имя обязательно" });
 
-    const result = db.transaction(() => {
-      const users = readState("dk_users") || [];
+    const result = await withTransaction(async (client) => {
+      const users = await readState("dk_users", client) || [];
       if (users.some(u => u.email === email)) throw { status: 409, message: "Email уже занят" };
 
       const expYears = noExperience ? 0 : (+experienceYears || 0);
@@ -1065,15 +1090,15 @@ app.post("/api/admin/users", requireAdmin, (req, res) => {
         updatedAt: now,
       };
       const updated = [...users, newUser];
-      writeState("dk_users", updated);
+      await writeState("dk_users", updated, client);
 
-      const logs = readState("dk_logs") || [];
+      const logs = await readState("dk_logs", client) || [];
       const actor = users.find(u => u.id === req.user.userId);
       const actorName = actor?.name?.split(" ").slice(0, 2).join(" ") || "Админ";
-      writeState("dk_logs", [...logs, { id: Date.now() + Math.random(), userId: req.user.userId, userName: actorName, message: `Создан пользователь: ${newUser.name} (${newUser.email})`, date: now }]);
+      await writeState("dk_logs", [...logs, { id: Date.now() + Math.random(), userId: req.user.userId, userName: actorName, message: `Создан пользователь: ${newUser.name} (${newUser.email})`, date: now }], client);
 
       return sanitizeUser(newUser);
-    })();
+    });
     res.json({ ok: true, user: result });
   } catch (e) {
     if (e.status) return res.status(e.status).json({ error: e.message });
@@ -1083,11 +1108,11 @@ app.post("/api/admin/users", requireAdmin, (req, res) => {
 });
 
 // PATCH /api/admin/users/:id — update user fields (not password)
-app.patch("/api/admin/users/:id", requireAdmin, (req, res) => {
+app.patch("/api/admin/users/:id", requireAdmin, async (req, res) => {
   try {
     const userId = +req.params.id;
-    const result = db.transaction(() => {
-      const users = readState("dk_users") || [];
+    const result = await withTransaction(async (client) => {
+      const users = await readState("dk_users", client) || [];
       const idx = users.findIndex(u => u.id === userId);
       if (idx === -1) throw { status: 404, message: "Пользователь не найден" };
 
@@ -1100,9 +1125,9 @@ app.patch("/api/admin/users/:id", requireAdmin, (req, res) => {
         updated.name = `${updated.firstName || ""} ${updated.lastName || ""}`.trim();
       }
       const newUsers = users.map((u, i) => i === idx ? updated : u);
-      writeState("dk_users", newUsers);
+      await writeState("dk_users", newUsers, client);
       return sanitizeUser(updated);
-    })();
+    });
     res.json({ ok: true, user: result });
   } catch (e) {
     if (e.status) return res.status(e.status).json({ error: e.message });
@@ -1111,18 +1136,18 @@ app.patch("/api/admin/users/:id", requireAdmin, (req, res) => {
 });
 
 // POST /api/admin/users/:id/password — change password
-app.post("/api/admin/users/:id/password", requireAdmin, (req, res) => {
+app.post("/api/admin/users/:id/password", requireAdmin, async (req, res) => {
   try {
     const userId = +req.params.id;
     const { newPassword } = req.body;
     if (!newPassword || newPassword.length < 4) return res.status(400).json({ error: "Пароль мин. 4 символа" });
-    db.transaction(() => {
-      const users = readState("dk_users") || [];
+    await withTransaction(async (client) => {
+      const users = await readState("dk_users", client) || [];
       const idx = users.findIndex(u => u.id === userId);
       if (idx === -1) throw { status: 404, message: "Пользователь не найден" };
       users[idx] = { ...users[idx], password: hashPassword(newPassword), updatedAt: new Date().toISOString() };
-      writeState("dk_users", users);
-    })();
+      await writeState("dk_users", users, client);
+    });
     res.json({ ok: true });
   } catch (e) {
     if (e.status) return res.status(e.status).json({ error: e.message });
@@ -1131,19 +1156,19 @@ app.post("/api/admin/users/:id/password", requireAdmin, (req, res) => {
 });
 
 // POST /api/admin/users/:id/block — toggle block status
-app.post("/api/admin/users/:id/block", requireAdmin, (req, res) => {
+app.post("/api/admin/users/:id/block", requireAdmin, async (req, res) => {
   try {
     const userId = +req.params.id;
     const { blocked, reason } = req.body;
-    const result = db.transaction(() => {
-      const users = readState("dk_users") || [];
+    const result = await withTransaction(async (client) => {
+      const users = await readState("dk_users", client) || [];
       const idx = users.findIndex(u => u.id === userId);
       if (idx === -1) throw { status: 404, message: "Пользователь не найден" };
       if (users[idx].id === req.user.userId) throw { status: 400, message: "Нельзя заблокировать себя" };
       users[idx] = { ...users[idx], status: blocked ? "blocked" : "active", blockReason: blocked ? (reason || "") : "", updatedAt: new Date().toISOString() };
-      writeState("dk_users", users);
+      await writeState("dk_users", users, client);
       return sanitizeUser(users[idx]);
-    })();
+    });
     res.json({ ok: true, user: result });
   } catch (e) {
     if (e.status) return res.status(e.status).json({ error: e.message });
@@ -1152,13 +1177,13 @@ app.post("/api/admin/users/:id/block", requireAdmin, (req, res) => {
 });
 
 // ── BOOTSTRAP / SEED ──
-// Runs once at server start to ensure a fresh SQLite DB has working demo accounts.
+// Runs once at server start to ensure a fresh PostgreSQL DB has working demo accounts.
 // Safe to run repeatedly — only writes keys that don't exist yet.
-function bootstrapState() {
+async function bootstrapState() {
   console.log("[bootstrap] Checking state...");
 
   // ── Demo users ──
-  const usersRow = db.prepare("SELECT value FROM state WHERE key = 'dk_users'").get();
+  const usersRow = (await pool.query("SELECT value FROM state WHERE key = 'dk_users'")).rows[0];
   if (!usersRow) {
     const now = (suffix) => `2024-01-${suffix}T08:00:00.000Z`;
     const demoUsers = [
@@ -1173,7 +1198,7 @@ function bootstrapState() {
       { id:9,  firstName:"Тимур",   lastName:"Исмаилов",   name:"Тимур Исмаилов",      birthDate:"1990-08-18", phone:"+7 900 999 0009", email:"tech@factory.ru",     emailVerified:true, roleId:3, status:"active", jobTitle:"технарь",       noExperience:false, experienceYears:6,  experienceMonths:0,  experienceMonthsTotal:72,  payType:"фиксированная", dailyNorm:0,  pieceRate:0,  fixedDayRate:2000, comment:"Технарь",                 createdAt:now("20"), updatedAt:now("20"), password:hashPassword("worker123") },
       { id:10, firstName:"Назира",  lastName:"Юсупова",    name:"Назира Юсупова",      birthDate:"1993-02-28", phone:"+7 900 100 0010", email:"cleaner@factory.ru",  emailVerified:true, roleId:3, status:"active", jobTitle:"техничка",      noExperience:false, experienceYears:2,  experienceMonths:0,  experienceMonthsTotal:24,  payType:"фиксированная", dailyNorm:0,  pieceRate:0,  fixedDayRate:1200, comment:"Уборщица",                createdAt:now("21"), updatedAt:now("21"), password:hashPassword("worker123") },
     ];
-    writeState("dk_users", demoUsers);
+    await writeState("dk_users", demoUsers);
     console.log(`[bootstrap] Seeded dk_users with ${demoUsers.length} demo accounts`);
   } else {
     // Migrate any __pending__ passwords that might be left from old frontend-created users
@@ -1187,19 +1212,20 @@ function bootstrapState() {
       return u;
     });
     if (changed) {
-      writeState("dk_users", migrated);
+      await writeState("dk_users", migrated);
       console.log("[bootstrap] Migrated __pending__ passwords");
     }
   }
 
   // ── Initial product catalogue ──
-  const seedIfMissing = (key, val) => {
-    if (!db.prepare("SELECT 1 FROM state WHERE key = ?").get(key)) {
-      writeState(key, val);
+  const seedIfMissing = async (key, val) => {
+    const check = await pool.query("SELECT 1 FROM state WHERE key = $1", [key]);
+    if (check.rows.length === 0) {
+      await writeState(key, val);
     }
   };
 
-  seedIfMissing("dk_products", [
+  await seedIfMissing("dk_products", [
     { id:1, name:"Пельмени Домашние",   category:"Пельмени", description:"Классические с говядиной и бараниной", costPrice:280, sellPrice:450, stock:150, unit:"кг", status:"готов",           createdAt:"2024-01-20T10:00:00", updatedAt:"2024-06-01T12:00:00", deleted:false, techCard:["Подготовить тесто пельменное (замес 20 мин)","Подготовить фарш: говядина + баранина + лук + специи","Раскатать тесто, нарезать кружки","Лепка пельменей (ручная или автомат)","Заморозка при -18°C (2 часа)","Упаковка и маркировка"] },
     { id:2, name:"Котлеты По-киевски",  category:"Котлеты",  description:"Куриные котлеты с маслом",            costPrice:320, sellPrice:520, stock:80,  unit:"шт", status:"в производстве",  createdAt:"2024-02-15T09:00:00", updatedAt:"2024-06-02T14:00:00", deleted:false, techCard:["Отбить куриное филе","Завернуть сливочное масло в филе","Панировка: мука → яйцо → сухари","Обжарка 3 мин с каждой стороны","Доготовка в духовке 15 мин при 180°C","Охлаждение и упаковка"] },
     { id:3, name:"Вареники с картошкой",category:"Вареники", description:"С картофелем и жареным луком",         costPrice:200, sellPrice:350, stock:200, unit:"кг", status:"готов",           createdAt:"2024-03-01T11:00:00", updatedAt:"2024-06-03T10:00:00", deleted:false, techCard:["Приготовить тесто","Сварить и размять картофель","Обжарить лук, добавить в начинку","Раскатать тесто, вырезать кружки","Лепка вареников","Заморозка и упаковка"] },
@@ -1207,7 +1233,7 @@ function bootstrapState() {
     { id:5, name:"Манты Узбекские",     category:"Манты",    description:"Традиционные с бараниной",             costPrice:350, sellPrice:550, stock:40,  unit:"шт", status:"в производстве",  createdAt:"2024-04-01T10:00:00", updatedAt:"2024-06-05T11:00:00", deleted:false, techCard:["Подготовить тесто (тонкое раскатывание)","Нарезать баранину и лук кубиками","Добавить специи и курдючный жир","Лепка мантов (классическая форма)","Варка на пару 45 мин","Охлаждение и упаковка"] },
   ]);
 
-  seedIfMissing("dk_raw_mats", [
+  await seedIfMissing("dk_raw_mats", [
     { id:1,  name:"Говядина",        category:"Мясо",    unit:"кг", stock:500, minStock:100, costPerUnit:650,  updatedAt:"2024-06-01T10:00:00" },
     { id:2,  name:"Телятина",        category:"Мясо",    unit:"кг", stock:400, minStock:80,  costPerUnit:550,  updatedAt:"2024-06-01T10:00:00" },
     { id:3,  name:"Курица (филе)",   category:"Мясо",    unit:"кг", stock:300, minStock:60,  costPerUnit:380,  updatedAt:"2024-06-01T10:00:00" },
@@ -1221,7 +1247,7 @@ function bootstrapState() {
     { id:11, name:"Соль",            category:"Специи",  unit:"кг", stock:100, minStock:20,  costPerUnit:30,   updatedAt:"2024-06-01T10:00:00" },
   ]);
 
-  seedIfMissing("dk_recipes", [
+  await seedIfMissing("dk_recipes", [
     { id:1, productId:1, items:[{rawId:1,qty:0.3,unit:"кг"},{rawId:2,qty:0.3,unit:"кг"},{rawId:5,qty:0.4,unit:"кг"},{rawId:8,qty:0.05,unit:"кг"},{rawId:10,qty:0.01,unit:"кг"},{rawId:11,qty:0.02,unit:"кг"}], createdAt:"2024-01-20T10:00:00", updatedAt:"2024-01-20T10:00:00" },
     { id:2, productId:2, items:[{rawId:3,qty:0.15,unit:"кг"},{rawId:9,qty:0.03,unit:"кг"},{rawId:10,qty:0.005,unit:"кг"},{rawId:11,qty:0.01,unit:"кг"}], createdAt:"2024-02-15T09:00:00", updatedAt:"2024-02-15T09:00:00" },
     { id:3, productId:3, items:[{rawId:5,qty:0.4,unit:"кг"},{rawId:7,qty:0.5,unit:"кг"},{rawId:8,qty:0.08,unit:"кг"},{rawId:9,qty:0.02,unit:"кг"},{rawId:11,qty:0.01,unit:"кг"}], createdAt:"2024-03-01T11:00:00", updatedAt:"2024-03-01T11:00:00" },
@@ -1229,7 +1255,7 @@ function bootstrapState() {
     { id:5, productId:5, items:[{rawId:4,qty:0.25,unit:"кг"},{rawId:5,qty:0.35,unit:"кг"},{rawId:8,qty:0.1,unit:"кг"},{rawId:10,qty:0.015,unit:"кг"},{rawId:11,qty:0.02,unit:"кг"}], createdAt:"2024-04-01T10:00:00", updatedAt:"2024-04-01T10:00:00" },
   ]);
 
-  seedIfMissing("dk_bonus_rules", [
+  await seedIfMissing("dk_bonus_rules", [
     { id:1, fromQty:0,   bonusPercent:0,  label:"Стандарт"      },
     { id:2, fromQty:100, bonusPercent:5,  label:"Хорошо"        },
     { id:3, fromQty:250, bonusPercent:10, label:"Отлично"       },
@@ -1237,7 +1263,7 @@ function bootstrapState() {
     { id:5, fromQty:800, bonusPercent:20, label:"Рекорд"        },
   ]);
 
-  seedIfMissing("dk_cameras", [
+  await seedIfMissing("dk_cameras", [
     { id:1, name:"Цех — линия 1",           zone:"Цех",   type:"demo", url:"", enabled:true, description:"Производственная линия №1",    refreshSec:5, createdAt:"2024-01-01T00:00:00" },
     { id:2, name:"Склад готовой продукции",  zone:"Склад", type:"demo", url:"", enabled:true, description:"Зона хранения",               refreshSec:5, createdAt:"2024-01-01T00:00:00" },
     { id:3, name:"Вход в здание",            zone:"Вход",  type:"demo", url:"", enabled:true, description:"Главный вход",                refreshSec:5, createdAt:"2024-01-01T00:00:00" },
@@ -1252,15 +1278,13 @@ function bootstrapState() {
     "dk_debts","dk_batches","dk_defects","dk_payroll","dk_trash",
     "dk_email_codes","dk_logs",
   ];
-  for (const key of emptyArrayKeys) seedIfMissing(key, []);
-  seedIfMissing("dk_base_salaries", {});
+  for (const key of emptyArrayKeys) await seedIfMissing(key, []);
+  await seedIfMissing("dk_base_salaries", {});
 
   console.log("[bootstrap] Done");
 }
 
-bootstrapState();
-
-const HOST = process.env.HOST || '127.0.0.1';
+const HOST = process.env.HOST || "127.0.0.1";
 
 // ── Health / ping (must be before SPA fallback) ──
 app.get("/api/health", (_req, res) => res.json({ ok: true, service: "dikanish-api", time: Date.now() }));
@@ -1275,6 +1299,16 @@ app.get("*", (_req, res) => {
   }
 });
 
-app.listen(PORT, HOST, () => {
-  console.log(`Dikanish API running at http://${HOST}:${PORT}`);
-});
+// ── Startup ──
+(async () => {
+  try {
+    await initDb();
+    await bootstrapState();
+    app.listen(PORT, HOST, () => {
+      console.log(`Dikanish API running at http://${HOST}:${PORT}`);
+    });
+  } catch (e) {
+    console.error("[startup] Fatal error:", e);
+    process.exit(1);
+  }
+})();

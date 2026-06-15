@@ -95,48 +95,59 @@
 
 ---
 
-## Запуск
+## Запуск (локально через Docker)
+
+Требования: [Node.js 20+](https://nodejs.org/) и [Docker Desktop](https://www.docker.com/products/docker-desktop/)
+
+### 1. Установить зависимости
 
 ```bash
 npm install
-npm run dev      # разработка
-npm run build    # сборка
-node server.js   # сервер
 ```
+
+### 2. Создать файл `.env`
+
+Скопируй и создай файл `.env` в корне проекта:
+
+```env
+DATABASE_URL=postgresql://dikanish:dikanish@localhost:5433/dikanish
+JWT_ACCESS_SECRET=dikanish-access-secret-change-in-prod
+JWT_REFRESH_SECRET=dikanish-refresh-secret-change-in-prod
+HOST=127.0.0.1
+PORT=3000
+```
+
+### 3. Запустить PostgreSQL
+
+```bash
+docker compose up db -d
+```
+
+Контейнер остаётся в фоне. После перезагрузки компьютера нужно запустить снова.
+
+### 4. Запустить проект
+
+```bash
+npm run dev
+```
+
+Откроется на [http://127.0.0.1:5173](http://127.0.0.1:5173)
+
+При первом запуске база данных заполняется демо-данными автоматически.
+
+---
 
 ### Тестовые аккаунты
 
 | Роль | Email | Пароль |
 |------|-------|--------|
-| Директор | director@factory.ru | director123 |
+| Директор (admin) | director@factory.ru | director123 |
 | Менеджер | manager@factory.ru | manager123 |
-| Работник | worker@factory.ru | worker123 |
-| Владелец | owner@factory.ru | owner123 |
+| Владелец (owner) | owner@factory.ru | owner123 |
+| Работник | lep1@factory.ru | worker123 |
 
 ---
 
 ## Стек
 
-React 19 · Vite · Recharts · Node.js · Express · SQLite (better-sqlite3 v12) · PM2
-
----
-
-## Windows: ошибка native binding (better_sqlite3.node)
-
-Если при запуске видишь `Could not locate the bindings file ... better_sqlite3.node`:
-
-1. Останови все Node-процессы.
-2. Убедись что npm-скрипты не отключены:
-   ```
-   npm config set ignore-scripts false
-   ```
-3. Удали `node_modules` и `package-lock.json`.
-4. Запусти `npm install` — пересоберёт нативный бинарник.
-5. Если ошибка повторяется, установи Visual Studio Build Tools:
-   `C:\Program Files\nodejs\install_tools.bat`
-   или скачай **Visual Studio Build Tools → Desktop development with C++**.
-6. Затем:
-   ```
-   npm rebuild better-sqlite3
-   npm run dev
-   ```
+React 19 · Vite · Recharts · Node.js · Express · PostgreSQL (pg) · Docker · PM2

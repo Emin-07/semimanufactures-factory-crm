@@ -12,6 +12,9 @@ dist
 dist-ssr
 *.local
 
+# Environment variables (contain secrets)
+.env
+
 # Backend data (SQLite database)
 data/
 
