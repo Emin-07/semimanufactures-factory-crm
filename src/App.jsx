@@ -38,6 +38,7 @@ import { CameraPage } from "./pages/CameraPage.jsx";
 import { OrdersBoardStandalone, OrdersBoardPage } from "./pages/OrdersBoardPage.jsx";
 import { BatchesPage } from "./pages/BatchesPage.jsx";
 import { DefectsPage } from "./pages/DefectsPage.jsx";
+import { AIChatPage } from "./pages/AIChatPage.jsx";
 
 // MAIN APP
 // ═══════════════════════════════════════════════════════════════
@@ -522,6 +523,7 @@ export default function App(){
     { id:"system", label:"Система", icon:I.gear, items:[
       {id:"notifications",label:"Уведомления",ok:true},
       {id:"cameras",label:"Камеры",ok:isManagerLike},
+      {id:"aiChat",label:"Помощник AI",ok:true},
     ]},
   ].map(g=>({...g,items:g.items.filter(i=>i.ok)})).filter(g=>g.items.length>0);
 
@@ -573,6 +575,7 @@ export default function App(){
       case "users":return isSuperAdmin?<UsersPage/>:<DashboardPage/>;
       case "logs":return isSuperAdmin?<LogsPage/>:<DashboardPage/>;
       case "cameras":return isManagerLike?<CameraPage/>:<DashboardPage/>;
+      case "aiChat":return <AIChatPage/>;
       default:return <DashboardPage/>;
     }
   };
