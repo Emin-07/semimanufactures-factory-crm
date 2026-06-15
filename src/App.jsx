@@ -294,6 +294,7 @@ export default function App(){
     @keyframes softFadeIn{from{opacity:0;transform:translateY(6px)}to{opacity:1;transform:translateY(0)}}
     @keyframes pulseBorder{0%,100%{box-shadow:0 0 0 1px rgba(255,107,95,.22),0 4px 16px rgba(255,107,95,.06)}50%{box-shadow:0 0 0 2px rgba(255,107,95,.38),0 8px 24px rgba(255,107,95,.12)}}
     @keyframes pulseGlow{0%,100%{opacity:1}50%{opacity:0.35}}
+    @keyframes spin{to{transform:rotate(360deg)}}
     option{background:#1a1612;color:${C.text}}
     .app-bg{
       min-height:100vh;height:100vh;

@@ -5,6 +5,9 @@ import { fileURLToPath } from "url";
 import { dirname, join } from "path";
 import { pbkdf2Sync, randomBytes, randomUUID } from "crypto";
 import fs from "fs";
+import { spawn } from "child_process";
+import { rm, mkdir } from "fs/promises";
+import { tmpdir } from "os";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const PORT = process.env.PORT || 3000;
@@ -1285,6 +1288,144 @@ async function bootstrapState() {
 }
 
 const HOST = process.env.HOST || "127.0.0.1";
+
+// ── RTSP → HLS via FFmpeg ──
+const ffmpegProcs = new Map(); // cameraId → ChildProcess
+
+// Resolve ffmpeg binary — check PATH first, then known WinGet install location
+function findFfmpeg() {
+  const candidates = [
+    "ffmpeg",
+    // WinGet default install for Gyan.FFmpeg
+    join(process.env.LOCALAPPDATA || "", "Microsoft", "WinGet", "Packages",
+      "Gyan.FFmpeg_Microsoft.Winget.Source_8wekyb3d8bbwe",
+      "ffmpeg-8.1.1-full_build", "bin", "ffmpeg.exe"),
+    // Common manual install
+    "C:\\ffmpeg\\bin\\ffmpeg.exe",
+    "/usr/bin/ffmpeg",
+    "/usr/local/bin/ffmpeg",
+  ];
+  for (const c of candidates) {
+    if (c === "ffmpeg") { try { require; } catch {} return c; } // always try bare name first
+    if (fs.existsSync(c)) return c;
+  }
+  return "ffmpeg"; // fallback, will fail with clear error
+}
+const FFMPEG_BIN = findFfmpeg();
+console.log(`[cameras] ffmpeg → ${FFMPEG_BIN}`);
+
+function hlsDir(id) {
+  return join(tmpdir(), "dikanish-hls", String(id));
+}
+
+function requireManager(req, res, next) {
+  if (!req.user) return res.status(401).json({ error: "Не авторизован" });
+  if (!satisfies(req.user.roleId, "manager")) return res.status(403).json({ error: "Недостаточно прав" });
+  next();
+}
+
+app.post("/api/cameras/:id/start", requireManager, async (req, res) => {
+  const { id } = req.params;
+  const { rtspUrl } = req.body;
+  if (!rtspUrl) return res.status(400).json({ error: "Укажите rtspUrl" });
+
+  if (ffmpegProcs.has(id)) return res.json({ ok: true, already: true });
+
+  const dir = hlsDir(id);
+  try {
+    await mkdir(dir, { recursive: true });
+  } catch {}
+
+  const isRtsp = rtspUrl.startsWith("rtsp://") || rtspUrl.startsWith("rtsps://");
+  const inputArgs = isRtsp
+    ? ["-rtsp_transport", "tcp", "-i", rtspUrl]
+    : ["-i", rtspUrl]; // works for http/https HLS, MJPEG, MP4
+
+  const proc = spawn(FFMPEG_BIN, [
+    ...inputArgs,
+    "-c:v", "copy",
+    "-an",
+    "-f", "hls",
+    "-hls_time", "2",
+    "-hls_list_size", "3",
+    "-hls_flags", "delete_segments",
+    join(dir, "index.m3u8"),
+  ], { stdio: "ignore" });
+
+  let startError = null;
+  proc.on("error", (e) => {
+    startError = e.message;
+    console.error(`[ffmpeg cam ${id}]`, e.message);
+    ffmpegProcs.delete(id);
+  });
+  proc.on("exit", (code) => {
+    ffmpegProcs.delete(id);
+    if (code !== 0) console.log(`[ffmpeg cam ${id}] exited with code ${code}`);
+  });
+
+  // Give FFmpeg 400ms to fail fast (e.g. binary not found)
+  await new Promise(r => setTimeout(r, 400));
+  if (startError) return res.status(500).json({ error: `FFmpeg: ${startError}` });
+
+  ffmpegProcs.set(id, proc);
+  res.json({ ok: true });
+});
+
+app.post("/api/cameras/:id/stop", requireManager, async (req, res) => {
+  const { id } = req.params;
+  const proc = ffmpegProcs.get(id);
+  if (proc) {
+    proc.kill("SIGKILL");
+    ffmpegProcs.delete(id);
+  }
+  try { await rm(hlsDir(id), { recursive: true, force: true }); } catch {}
+  res.json({ ok: true });
+});
+
+app.get("/api/cameras/:id/hls/:file", requireManager, (req, res) => {
+  const filePath = join(hlsDir(req.params.id), req.params.file);
+  if (!fs.existsSync(filePath)) return res.status(404).end();
+  const ext = req.params.file.split(".").pop();
+  res.setHeader("Content-Type", ext === "m3u8" ? "application/vnd.apple.mpegurl" : "video/MP2T");
+  res.setHeader("Cache-Control", "no-cache");
+  res.sendFile(filePath);
+});
+
+// ── HLS proxy (bypasses CORS on external streams) ──
+app.get("/api/cameras/hls-proxy", requireManager, async (req, res) => {
+  const { url } = req.query;
+  if (!url) return res.status(400).end();
+  try {
+    const upstream = await fetch(url, { headers: { "User-Agent": "Mozilla/5.0" } });
+    if (!upstream.ok) return res.status(upstream.status).end();
+
+    const ct = upstream.headers.get("content-type") || "";
+    const isPlaylist = url.includes(".m3u8") || ct.includes("mpegurl");
+
+    if (isPlaylist) {
+      const base = url.substring(0, url.lastIndexOf("/") + 1);
+      const text = await upstream.text();
+      // Rewrite every non-comment line (segment URLs and sub-playlist URLs)
+      const rewritten = text.split("\n").map(line => {
+        const t = line.trim();
+        if (!t || t.startsWith("#")) return line;
+        const abs = t.startsWith("http") ? t : base + t;
+        return `/api/cameras/hls-proxy?url=${encodeURIComponent(abs)}`;
+      }).join("\n");
+      res.setHeader("Content-Type", "application/vnd.apple.mpegurl");
+      res.setHeader("Cache-Control", "no-cache");
+      return res.send(rewritten);
+    }
+
+    // Binary segment — stream directly
+    res.setHeader("Content-Type", ct || "video/MP2T");
+    res.setHeader("Cache-Control", "no-cache");
+    const buf = await upstream.arrayBuffer();
+    res.send(Buffer.from(buf));
+  } catch (e) {
+    res.status(502).json({ error: e.message });
+  }
+});
 
 // ── Health / ping (must be before SPA fallback) ──
 app.get("/api/health", (_req, res) => res.json({ ok: true, service: "dikanish-api", time: Date.now() }));

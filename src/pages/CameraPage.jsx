@@ -1,4 +1,5 @@
 import { useState, useEffect, useCallback, useMemo, useContext, useRef } from "react";
+import Hls from "hls.js";
 import { BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, PieChart, Pie, Cell, LineChart, Line, Legend, AreaChart, Area } from "recharts";
 import { AppContext } from "../context/AppContext.js";
 import { ROLES, JOB_TITLES, PAY_TYPES, STORE_STATUSES, STORE_STATUS_LABELS, ORDER_SOURCES, ATTENDANCE_TYPES, ATTENDANCE_TYPE_COLORS, BATCH_STATUSES, DEFECT_REASONS, PAYROLL_STATUSES, CATEGORIES, UNITS, STATUSES, TASK_STATUSES, RAW_CATEGORIES, RAW_UNITS, NOTIF_TYPES, MARK_TYPES, PLAN_STATUSES, ORDER_STATUSES, ORDER_PRIORITIES, BOARD_COLUMNS, MOVEMENT_TYPES, DEBT_STATUSES, CAMERA_SOURCE_TYPES, CAMERA_SOURCE_LABELS, CAMERA_ZONES } from "../constants/index.js";
@@ -50,6 +51,145 @@ const DemoCameraFeed = ({camId, name}) => {
         <div style={{fontSize:11,color:"rgba(0,255,80,0.7)",fontFamily:"monospace",letterSpacing:1}}>{ts}</div>
         <div style={{fontSize:9,color:"rgba(0,255,80,0.4)",fontFamily:"monospace"}}>{ds}</div>
       </div>
+    </div>
+  );
+};
+
+// Direct HLS player (for camera type "hls" — external .m3u8 URL)
+const HlsPlayer = ({ url }) => {
+  const videoRef = useRef(null);
+  const hlsRef = useRef(null);
+  const [status, setStatus] = useState("connecting");
+
+  useEffect(() => {
+    if (!url) { setStatus("error"); return; }
+    let destroyed = false;
+    const video = videoRef.current;
+    // Route external URLs through our proxy to avoid CORS
+    const src = url.startsWith("http") ? `/api/cameras/hls-proxy?url=${encodeURIComponent(url)}` : url;
+
+    if (Hls.isSupported()) {
+      const hls = new Hls({ maxBufferLength: 10, liveSyncDurationCount: 2 });
+      hlsRef.current = hls;
+      hls.loadSource(src);
+      hls.attachMedia(video);
+      hls.on(Hls.Events.MANIFEST_PARSED, () => {
+        if (!destroyed) { setStatus("playing"); video.play().catch(() => {}); }
+      });
+      hls.on(Hls.Events.ERROR, (_e, data) => {
+        if (data.fatal && !destroyed) setStatus("error");
+      });
+    } else if (video.canPlayType("application/vnd.apple.mpegurl")) {
+      video.src = src;
+      video.addEventListener("loadedmetadata", () => { if (!destroyed) { setStatus("playing"); video.play().catch(() => {}); } });
+      video.addEventListener("error", () => { if (!destroyed) setStatus("error"); });
+    } else {
+      setStatus("error");
+    }
+
+    return () => {
+      destroyed = true;
+      if (hlsRef.current) { hlsRef.current.destroy(); hlsRef.current = null; }
+    };
+  }, [url]);
+
+  return (
+    <div style={{ width: "100%", height: "100%", position: "relative", background: "#000" }}>
+      <video ref={videoRef} muted playsInline style={{ width: "100%", height: "100%", objectFit: "cover", display: status === "playing" ? "block" : "none" }} />
+      {status === "connecting" && (
+        <div style={{ position: "absolute", inset: 0, display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", gap: 10 }}>
+          <div style={{ width: 28, height: 28, border: `3px solid ${C.border}`, borderTopColor: C.primary, borderRadius: "50%", animation: "spin 0.8s linear infinite" }} />
+          <span style={{ fontSize: 11, color: C.muted }}>Загрузка потока...</span>
+        </div>
+      )}
+      {status === "error" && (
+        <div style={{ position: "absolute", inset: 0, display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", gap: 8, padding: 16 }}>
+          <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke={C.danger} strokeWidth="1.5"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></svg>
+          <span style={{ fontSize: 12, color: C.danger, fontWeight: 600 }}>Поток недоступен</span>
+          <span style={{ fontSize: 10, color: C.dim, textAlign: "center", maxWidth: 200, wordBreak: "break-all" }}>{url}</span>
+          <button onClick={() => { setStatus("connecting"); }} style={{ fontSize: 11, color: C.primary, background: "none", border: `1px solid ${C.primary}40`, borderRadius: 4, padding: "3px 12px", cursor: "pointer", marginTop: 4 }}>Повторить</button>
+        </div>
+      )}
+    </div>
+  );
+};
+
+// HLS player for RTSP cameras (via server-side FFmpeg transcoding)
+const CameraPlayer = ({ cam }) => {
+  const videoRef = useRef(null);
+  const hlsRef = useRef(null);
+  const [status, setStatus] = useState("connecting"); // connecting | playing | error
+
+  useEffect(() => {
+    let destroyed = false;
+    const hlsUrl = `/api/cameras/${cam.id}/hls/index.m3u8`;
+
+    // Tell server to start FFmpeg
+    fetch(`/api/cameras/${cam.id}/start`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ rtspUrl: cam.url }),
+    }).then(r => r.json()).then(d => {
+      if (!d.ok && d.error && !destroyed) setStatus("error");
+    }).catch(() => { if (!destroyed) setStatus("error"); });
+
+    // Wait for FFmpeg to produce first HLS segments (~5s for remote RTSP)
+    const initTimer = setTimeout(() => {
+      if (destroyed) return;
+      const video = videoRef.current;
+      if (!video) return;
+
+      if (Hls.isSupported()) {
+        const hls = new Hls({ maxBufferLength: 10, liveSyncDurationCount: 2 });
+        hlsRef.current = hls;
+        hls.loadSource(hlsUrl);
+        hls.attachMedia(video);
+        hls.on(Hls.Events.MANIFEST_PARSED, () => {
+          if (!destroyed) { setStatus("playing"); video.play().catch(() => {}); }
+        });
+        hls.on(Hls.Events.ERROR, (_e, data) => {
+          if (data.fatal && !destroyed) setStatus("error");
+        });
+      } else if (video.canPlayType("application/vnd.apple.mpegurl")) {
+        video.src = hlsUrl;
+        video.addEventListener("loadedmetadata", () => { if (!destroyed) { setStatus("playing"); video.play().catch(() => {}); } });
+        video.addEventListener("error", () => { if (!destroyed) setStatus("error"); });
+      } else {
+        setStatus("error");
+      }
+    }, 5000);
+
+    return () => {
+      destroyed = true;
+      clearTimeout(initTimer);
+      if (hlsRef.current) { hlsRef.current.destroy(); hlsRef.current = null; }
+      fetch(`/api/cameras/${cam.id}/stop`, { method: "POST" }).catch(() => {});
+    };
+  }, [cam.id, cam.url]);
+
+  return (
+    <div style={{ width: "100%", height: "100%", position: "relative", background: "#000" }}>
+      <video
+        ref={videoRef}
+        muted
+        playsInline
+        style={{ width: "100%", height: "100%", objectFit: "cover", display: status === "playing" ? "block" : "none" }}
+      />
+      {status === "connecting" && (
+        <div style={{ position: "absolute", inset: 0, display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", gap: 10 }}>
+          <div style={{ width: 28, height: 28, border: `3px solid ${C.border}`, borderTopColor: C.primary, borderRadius: "50%", animation: "spin 0.8s linear infinite" }} />
+          <span style={{ fontSize: 11, color: C.muted }}>Подключение к RTSP...</span>
+          <span style={{ fontSize: 10, color: C.dim, maxWidth: 180, textAlign: "center", wordBreak: "break-all" }}>{cam.url}</span>
+        </div>
+      )}
+      {status === "error" && (
+        <div style={{ position: "absolute", inset: 0, display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", gap: 8, padding: 16 }}>
+          <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke={C.danger} strokeWidth="1.5"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></svg>
+          <span style={{ fontSize: 12, color: C.danger, fontWeight: 600 }}>Ошибка подключения</span>
+          <span style={{ fontSize: 10, color: C.dim, textAlign: "center" }}>Проверьте RTSP-адрес и доступность камеры. FFmpeg должен быть установлен на сервере.</span>
+          <button onClick={() => setStatus("connecting")} style={{ fontSize: 11, color: C.primary, background: "none", border: `1px solid ${C.primary}40`, borderRadius: 4, padding: "3px 12px", cursor: "pointer", marginTop: 4 }}>Повторить</button>
+        </div>
+      )}
     </div>
   );
 };
@@ -108,7 +248,9 @@ const CameraFeed = ({cam}) => {
     );
   }
 
-  if(cam.type === "mp4" || cam.type === "hls") return (
+  if(cam.type === "hls") return <HlsPlayer url={cam.url}/>;
+
+  if(cam.type === "mp4") return (
     <video
       key={cam.url}
       src={cam.url}
@@ -116,25 +258,18 @@ const CameraFeed = ({cam}) => {
       style={{width:"100%",height:"100%",objectFit:"cover",display:"block",background:"#000"}}
       onError={()=>setErrored(true)}
     >
-      {cam.type==="hls"&&<source src={cam.url} type="application/x-mpegURL"/>}
-      {cam.type==="mp4"&&<source src={cam.url} type="video/mp4"/>}
+      <source src={cam.url} type="video/mp4"/>
     </video>
   );
 
-  if(cam.type === "rtsp") return (
-    <div style={{width:"100%",height:"100%",display:"flex",alignItems:"center",justifyContent:"center",background:"#0f0c09",flexDirection:"column",gap:8,padding:16}}>
-      <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="#E8A838" strokeWidth="1.5"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></svg>
-      <span style={{fontSize:12,color:"#E8A838",fontWeight:600}}>RTSP не поддерживается</span>
-      <span style={{fontSize:10,color:"rgba(255,255,255,0.3)",textAlign:"center",lineHeight:1.5}}>Браузер не воспроизводит RTSP напрямую. Используйте WebRTC-шлюз (напр. go2rtc, MediaMTX) и выберите тип "iframe" или "HLS".</span>
-    </div>
-  );
+  if(cam.type === "rtsp") return <CameraPlayer cam={cam}/>;
 
   return <DemoCameraFeed camId={cam.id} name={cam.name}/>;
 };
 
 // Camera tile: feed + overlay label
 const CameraTile = ({cam, onFullscreen}) => {
-  const isAvailable = cam.enabled && cam.type !== "rtsp";
+  const isAvailable = cam.enabled;
   return (
     <div
       style={{position:"relative",background:"#080604",borderRadius:10,overflow:"hidden",border:`1px solid ${isAvailable?"rgba(255,255,255,0.08)":"rgba(196,78,61,0.2)"}`,cursor:"pointer",aspectRatio:"16/9"}}
@@ -318,8 +453,8 @@ const CameraPage = () => {
           {form.type==="image"&&<Inp label="Обновл. (сек)" value={form.refreshSec} onChange={e=>setForm({...form,refreshSec:+e.target.value})} type="number" min={1} max={60}/>}
         </div>
         {form.type==="rtsp"&&(
-          <div style={{padding:"8px 12px",background:"rgba(232,168,56,0.08)",border:"1px solid rgba(232,168,56,0.25)",borderRadius:7,fontSize:11,color:"#E8A838",marginBottom:8}}>
-            ⚠ RTSP не воспроизводится браузером напрямую. Настройте WebRTC-шлюз (go2rtc / MediaMTX) и выберите тип "iframe" с URL шлюза.
+          <div style={{padding:"8px 12px",background:"rgba(91,141,181,0.08)",border:"1px solid rgba(91,141,181,0.2)",borderRadius:7,fontSize:11,color:C.info,marginBottom:8}}>
+            ℹ RTSP конвертируется в HLS через FFmpeg на сервере. FFmpeg должен быть установлен: <code style={{color:C.primary}}>apt install ffmpeg</code>. Укажите полный RTSP-адрес камеры ниже.
           </div>
         )}
         {form.type==="hls"&&(
@@ -327,8 +462,8 @@ const CameraPage = () => {
             ℹ HLS (.m3u8) воспроизводится нативно в Safari. В Chrome/Firefox требуется прокси с поддержкой HLS или конвертация.
           </div>
         )}
-        {form.type!=="demo"&&form.type!=="rtsp"&&(
-          <Inp label="URL потока / источника" value={form.url} onChange={e=>setForm({...form,url:e.target.value})} error={errs.url}/>
+        {form.type!=="demo"&&(
+          <Inp label={form.type==="rtsp"?"RTSP URL (rtsp://...)":"URL потока / источника"} value={form.url} onChange={e=>setForm({...form,url:e.target.value})} error={errs.url} placeholder={form.type==="rtsp"?"rtsp://user:pass@192.168.1.100:554/stream":""}/>
         )}
         <Inp label="Описание (необязательно)" value={form.description} onChange={e=>setForm({...form,description:e.target.value})}/>
         <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:8}}>
