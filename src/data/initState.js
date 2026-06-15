@@ -1,0 +1,25 @@
+// Fallback initial state before API sync (server seeds real demo data on first boot)
+export const INIT_USERS = [];
+export const INIT_PRODUCTS = [];
+export const INIT_RAW_MATERIALS = [];
+export const INIT_RECIPES = [];
+export const INIT_TASKS = [];
+export const INIT_TASK_EMPLOYEES = [];
+export const INIT_EMPLOYEE_HISTORY = [];
+export const INIT_PRODUCTION_PLANS = [];
+export const INIT_CLIENTS = [];
+export const INIT_CLIENT_ORDERS = [];
+export const INIT_SALES = [];
+export const INIT_INVENTORY_MOVEMENTS = [];
+export const INIT_SUPPLIERS = [];
+export const INIT_DELIVERIES = [];
+export const INIT_RAW_MOVEMENTS = [];
+export const INIT_NOTIFICATIONS = [];
+export const INIT_MARKS = [];
+export const INIT_PRODUCTION_OUTPUTS = [];
+export const INIT_DEBTS = [];
+export const INIT_BATCHES = [];
+export const INIT_DEFECTS = [];
+export const INIT_CAMERAS = [];
+export const INIT_BONUS_RULES = [];
+export const INIT_BASE_SALARIES = {};
