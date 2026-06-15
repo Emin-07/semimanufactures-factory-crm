@@ -1,9 +1,9 @@
 import express from "express";
 import Database from "better-sqlite3";
-import session from "express-session";
+import jwt from "jsonwebtoken";
 import { fileURLToPath } from "url";
 import { dirname, join } from "path";
-import { pbkdf2Sync, randomBytes } from "crypto";
+import { pbkdf2Sync, randomBytes, randomUUID } from "crypto";
 import fs from "fs";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -120,18 +120,43 @@ function satisfies(userRoleId, required) {
 const app = express();
 app.use(express.json({ limit: "10mb" }));
 
-const SESSION_SECRET = process.env.SESSION_SECRET || "dikanish-factory-secret-2024";
-app.use(session({
-  secret: SESSION_SECRET,
-  resave: false,
-  saveUninitialized: false,
-  cookie: {
-    httpOnly: true,
-    sameSite: "lax",
-    maxAge: 12 * 60 * 60 * 1000, // 12 hours
-    // secure: true  // enable when HTTPS is configured
-  },
-}));
+// ── JWT config ──
+const ACCESS_SECRET  = process.env.JWT_ACCESS_SECRET  || "dikanish-access-secret-change-in-prod";
+const REFRESH_SECRET = process.env.JWT_REFRESH_SECRET || "dikanish-refresh-secret-change-in-prod";
+const ACCESS_COOKIE_OPTS  = { httpOnly: true, sameSite: "lax", maxAge: 15 * 60 * 1000 };            // 15 min
+const REFRESH_COOKIE_OPTS = { httpOnly: true, sameSite: "lax", maxAge: 30 * 24 * 60 * 60 * 1000 };  // 30 days
+
+// Cookie helper — no extra package needed
+function getCookie(req, name) {
+  const header = req.headers.cookie || "";
+  for (const pair of header.split(";")) {
+    const [k, ...rest] = pair.trim().split("=");
+    if (k === name) return decodeURIComponent(rest.join("="));
+  }
+  return null;
+}
+
+// Refresh token table (for revocation on logout)
+db.exec(`
+  CREATE TABLE IF NOT EXISTS refresh_tokens (
+    id         TEXT    PRIMARY KEY,
+    user_id    INTEGER NOT NULL,
+    expires_at INTEGER NOT NULL
+  );
+`);
+db.prepare("DELETE FROM refresh_tokens WHERE expires_at < unixepoch()").run();
+
+// JWT middleware — parses access_token cookie and sets req.user if valid
+app.use((req, _res, next) => {
+  const token = getCookie(req, "access_token");
+  if (token) {
+    try {
+      const payload = jwt.verify(token, ACCESS_SECRET);
+      req.user = { userId: payload.userId, roleId: payload.roleId };
+    } catch {}
+  }
+  next();
+});
 
 // Serve built React app
 const distDir = join(__dirname, "dist");
@@ -147,7 +172,7 @@ function isBoardRequest(req) {
 
 // ── Auth middleware ──
 function requireAuth(req, res, next) {
-  if (req.session?.userId) return next();
+  if (req.user) return next();
   res.status(401).json({ error: "Не авторизован" });
 }
 
@@ -167,16 +192,16 @@ function checkKeyAccess(req, res, next) {
   }
 
   // Normal authenticated access
-  if (!req.session?.userId) {
+  if (!req.user) {
     return res.status(401).json({ error: "Не авторизован" });
   }
 
-  if (!satisfies(req.session.roleId, required)) {
+  if (!satisfies(req.user.roleId, required)) {
     return res.status(403).json({ error: "Недостаточно прав" });
   }
 
   // Extra: dk_users GET — strip password field before sending
-  req._stripPasswords = (key === "dk_users" && req.method === "GET" && roleLevel(req.session.roleId) !== "admin");
+  req._stripPasswords = (key === "dk_users" && req.method === "GET" && roleLevel(req.user.roleId) !== "admin");
 
   next();
 }
@@ -205,9 +230,15 @@ app.post("/api/auth/login", (req, res) => {
       db.prepare("UPDATE state SET value = ?, updated_at = unixepoch() WHERE key = 'dk_users'").run(JSON.stringify(updated));
     }
 
-    // Store only what's needed in session — never the password
-    req.session.userId = user.id;
-    req.session.roleId = user.roleId;
+    // Issue access token (15 min) and refresh token (30 days)
+    const accessToken = jwt.sign({ userId: user.id, roleId: user.roleId }, ACCESS_SECRET, { expiresIn: "15m" });
+    const jti = randomUUID();
+    const refreshExpiresAt = Math.floor(Date.now() / 1000) + 30 * 24 * 60 * 60;
+    const refreshToken = jwt.sign({ userId: user.id, roleId: user.roleId, jti }, REFRESH_SECRET, { expiresIn: "30d" });
+    db.prepare("INSERT INTO refresh_tokens (id, user_id, expires_at) VALUES (?, ?, ?)").run(jti, user.id, refreshExpiresAt);
+
+    res.cookie("access_token",  accessToken,  ACCESS_COOKIE_OPTS);
+    res.cookie("refresh_token", refreshToken, REFRESH_COOKIE_OPTS);
 
     // Return safe user object (no password)
     const { password: _pw, ...safeUser } = user;
@@ -219,39 +250,84 @@ app.post("/api/auth/login", (req, res) => {
 
 // POST /api/auth/logout
 app.post("/api/auth/logout", (req, res) => {
-  req.session.destroy(() => res.json({ ok: true }));
+  const token = getCookie(req, "refresh_token");
+  if (token) {
+    try {
+      const payload = jwt.verify(token, REFRESH_SECRET);
+      db.prepare("DELETE FROM refresh_tokens WHERE id = ?").run(payload.jti);
+    } catch {}
+  }
+  res.clearCookie("access_token");
+  res.clearCookie("refresh_token");
+  res.json({ ok: true });
 });
 
-// GET /api/auth/me — returns current user from session (no password)
+// GET /api/auth/me — returns current user; silently refreshes access token if needed
 app.get("/api/auth/me", (req, res) => {
-  if (!req.session?.userId) return res.status(401).json({ error: "Не авторизован" });
   try {
-    const row = db.prepare("SELECT value FROM state WHERE key = 'dk_users'").get();
-    if (!row) return res.status(404).json({ error: "Данные не найдены" });
-    const users = JSON.parse(row.value);
-    const user = users.find(u => u.id === req.session.userId);
-    if (!user) {
-      req.session.destroy(() => {});
-      return res.status(401).json({ error: "Пользователь не найден" });
+    const users = readState("dk_users") || [];
+
+    // Fast path: valid access token already parsed by middleware
+    if (req.user) {
+      const user = users.find(u => u.id === req.user.userId);
+      if (!user) return res.status(401).json({ error: "Пользователь не найден" });
+      if (user.status === "blocked") return res.status(403).json({ error: "Аккаунт заблокирован" });
+      // If role was changed by admin, issue a fresh access token
+      if (user.roleId !== req.user.roleId) {
+        const newAccess = jwt.sign({ userId: user.id, roleId: user.roleId }, ACCESS_SECRET, { expiresIn: "15m" });
+        res.cookie("access_token", newAccess, ACCESS_COOKIE_OPTS);
+      }
+      const { password: _pw, ...safeUser } = user;
+      return res.json(safeUser);
     }
-    if (user.status === "blocked") {
-      req.session.destroy(() => {});
-      return res.status(403).json({ error: "Аккаунт заблокирован" });
+
+    // Slow path: access token missing/expired — try the refresh token
+    const refreshRaw = getCookie(req, "refresh_token");
+    if (refreshRaw) {
+      const payload = jwt.verify(refreshRaw, REFRESH_SECRET); // throws if invalid/expired
+      const stored = db.prepare("SELECT * FROM refresh_tokens WHERE id = ?").get(payload.jti);
+      if (!stored) return res.status(401).json({ error: "Сессия истекла" });
+      const user = users.find(u => u.id === payload.userId);
+      if (!user) return res.status(401).json({ error: "Пользователь не найден" });
+      if (user.status === "blocked") return res.status(403).json({ error: "Аккаунт заблокирован" });
+      // Issue new access token
+      const newAccess = jwt.sign({ userId: user.id, roleId: user.roleId }, ACCESS_SECRET, { expiresIn: "15m" });
+      res.cookie("access_token", newAccess, ACCESS_COOKIE_OPTS);
+      const { password: _pw, ...safeUser } = user;
+      return res.json(safeUser);
     }
-    // Sync role from DB in case it was changed by admin
-    if (user.roleId !== req.session.roleId) {
-      req.session.roleId = user.roleId;
-    }
-    const { password: _pw, ...safeUser } = user;
-    res.json(safeUser);
+
+    res.status(401).json({ error: "Не авторизован" });
   } catch (e) {
-    res.status(500).json({ error: e.message });
+    res.status(401).json({ error: "Сессия истекла" });
+  }
+});
+
+// POST /api/auth/refresh — issue new access token using refresh token cookie
+app.post("/api/auth/refresh", (req, res) => {
+  const token = getCookie(req, "refresh_token");
+  if (!token) return res.status(401).json({ error: "Нет refresh токена" });
+  try {
+    const payload = jwt.verify(token, REFRESH_SECRET);
+    const stored = db.prepare("SELECT * FROM refresh_tokens WHERE id = ?").get(payload.jti);
+    if (!stored) return res.status(401).json({ error: "Refresh токен отозван" });
+    const users = readState("dk_users") || [];
+    const user = users.find(u => u.id === payload.userId);
+    if (!user || user.status === "blocked") {
+      db.prepare("DELETE FROM refresh_tokens WHERE id = ?").run(payload.jti);
+      return res.status(401).json({ error: "Пользователь недоступен" });
+    }
+    const newAccess = jwt.sign({ userId: user.id, roleId: user.roleId }, ACCESS_SECRET, { expiresIn: "15m" });
+    res.cookie("access_token", newAccess, ACCESS_COOKIE_OPTS);
+    res.json({ ok: true });
+  } catch {
+    res.status(401).json({ error: "Refresh токен истёк" });
   }
 });
 
 // POST /api/auth/change-password — admin only
 app.post("/api/auth/change-password", requireAuth, (req, res) => {
-  if (roleLevel(req.session.roleId) !== "admin") {
+  if (roleLevel(req.user.roleId) !== "admin") {
     return res.status(403).json({ error: "Только для администратора" });
   }
   try {
@@ -369,8 +445,8 @@ app.post("/api/actions/task-complete", requireAuth, (req, res) => {
       }
 
       // Worker authorization: must be assigned to this task
-      const isWorkerRole = roleLevel(req.session.roleId) === "worker";
-      if (isWorkerRole && !(task.userIds || []).includes(req.session.userId)) {
+      const isWorkerRole = roleLevel(req.user.roleId) === "worker";
+      if (isWorkerRole && !(task.userIds || []).includes(req.user.userId)) {
         throw { status: 403, message: "Вы не назначены на это задание" };
       }
 
@@ -407,7 +483,7 @@ app.post("/api/actions/task-complete", requireAuth, (req, res) => {
       const expiresAt = new Date(new Date(now).getTime() + 7 * 24 * 3600 * 1000).toISOString();
       const newBatch = {
         id: sharedBatchId, productId: task.productId, quantity: task.quantity,
-        producedAt: now, expiresAt, createdBy: req.session.userId,
+        producedAt: now, expiresAt, createdBy: req.user.userId,
         status: "активна", note: task.note || "", taskId,
       };
 
@@ -430,7 +506,7 @@ app.post("/api/actions/task-complete", requireAuth, (req, res) => {
           id: outId, productId: task.productId, employeeId: uid, quantity: qty,
           date: now, taskId, source: "task",
           batchId: firstWorker ? sharedBatchId : null,
-          comment: task.note || "", createdAt: now, createdBy: req.session.userId,
+          comment: task.note || "", createdAt: now, createdBy: req.user.userId,
         };
         newOutputs.push(out);
         state = serverApplyOutput(state, out);
@@ -440,7 +516,7 @@ app.post("/api/actions/task-complete", requireAuth, (req, res) => {
       // Notifications and log
       const users = readState("dk_users") || [];
       const product = state.dk_products.find(p => p.id === task.productId) || {};
-      const actor = users.find(u => u.id === req.session.userId);
+      const actor = users.find(u => u.id === req.user.userId);
       const actorName = actor?.name?.split(" ").slice(0, 2).join(" ") || "Работник";
       const workerNames = qEntries.map(([uid]) =>
         users.find(u => u.id === uid)?.name?.split(" ").slice(0, 2).join(" ") || "?"
@@ -453,11 +529,11 @@ app.post("/api/actions/task-complete", requireAuth, (req, res) => {
         title: `Задание ${isLate ? "просрочено" : "выполнено"}: ${product.name || ""}`,
         type: isLate ? "ошибка" : "информация",
         content: `${workerNames} ${isLate ? "просрочили" : "завершили"}: ${product.name || ""} x${task.quantity}`,
-        createdBy: req.session.userId, createdAt: now,
-        readBy: [req.session.userId], targetAll: true, targetUsers: [],
+        createdBy: req.user.userId, createdAt: now,
+        readBy: [req.user.userId], targetAll: true, targetUsers: [],
       };
       const newLog = {
-        id: Date.now(), userId: req.session.userId, userName: actorName,
+        id: Date.now(), userId: req.user.userId, userName: actorName,
         message: `Завершено: ${product.name || ""} x${task.quantity}${isLate ? " (просрочено)" : ""}`,
         date: now,
       };
@@ -513,8 +589,8 @@ app.post("/api/actions/output-record", requireAuth, (req, res) => {
   }
 
   // Worker can only record for themselves
-  const isWorkerRole = roleLevel(req.session.roleId) === "worker";
-  if (isWorkerRole && +employeeId !== req.session.userId) {
+  const isWorkerRole = roleLevel(req.user.roleId) === "worker";
+  if (isWorkerRole && +employeeId !== req.user.userId) {
     return res.status(403).json({ error: "Вы можете записывать выпуск только за себя" });
   }
 
@@ -529,11 +605,11 @@ app.post("/api/actions/output-record", requireAuth, (req, res) => {
       const out = {
         id, productId: +productId, employeeId: +employeeId, quantity: +quantity,
         date: outDate, comment: comment || "", source: "manual",
-        taskId: null, batchId, createdAt: now, createdBy: req.session.userId,
+        taskId: null, batchId, createdAt: now, createdBy: req.user.userId,
       };
       const newBatch = {
         id: batchId, productId: +productId, quantity: +quantity,
-        producedAt: outDate, expiresAt, createdBy: req.session.userId,
+        producedAt: outDate, expiresAt, createdBy: req.user.userId,
         status: "активна", note: comment || "", taskId: null,
       };
 
@@ -555,7 +631,7 @@ app.post("/api/actions/output-record", requireAuth, (req, res) => {
       const logs        = readState("dk_logs")         || [];
 
       const product  = state.dk_products.find(p => p.id === +productId) || {};
-      const actor    = users.find(u => u.id === req.session.userId);
+      const actor    = users.find(u => u.id === req.user.userId);
       const actorName = actor?.name?.split(" ").slice(0, 2).join(" ") || "Работник";
 
       const newNotif = {
@@ -563,11 +639,11 @@ app.post("/api/actions/output-record", requireAuth, (req, res) => {
         title: `Выпуск: ${product.name || ""} x${quantity}`,
         type: "информация",
         content: `${actorName} зафиксировал выпуск ${product.name || ""} — ${quantity} ${product.unit || ""}`,
-        createdBy: req.session.userId, createdAt: now,
-        readBy: [req.session.userId], targetAll: true, targetUsers: [],
+        createdBy: req.user.userId, createdAt: now,
+        readBy: [req.user.userId], targetAll: true, targetUsers: [],
       };
       const newLog = {
-        id: Date.now(), userId: req.session.userId, userName: actorName,
+        id: Date.now(), userId: req.user.userId, userName: actorName,
         message: `Выпуск: ${product.name || ""} x${quantity} → ${actorName}`, date: now,
       };
 
@@ -619,7 +695,7 @@ app.post("/api/actions/notifications/read", requireAuth, (req, res) => {
   try {
     const result = db.transaction(() => {
       const list = readState("dk_notifications") || [];
-      const uid = req.session.userId;
+      const uid = req.user.userId;
       let changed = false;
       const updated = list.map(n => {
         if (n.id !== notificationId) return n;
@@ -644,7 +720,7 @@ app.post("/api/actions/notifications/read-all", requireAuth, (req, res) => {
   try {
     const result = db.transaction(() => {
       const list = readState("dk_notifications") || [];
-      const uid = req.session.userId;
+      const uid = req.user.userId;
       let changed = false;
       const updated = list.map(n => {
         const targets = n.targetAll || (Array.isArray(n.targetUsers) && n.targetUsers.includes(uid));
@@ -677,11 +753,11 @@ app.post("/api/actions/log", requireAuth, (req, res) => {
     db.transaction(() => {
       const logs = readState("dk_logs") || [];
       const users = readState("dk_users") || [];
-      const actor = users.find(u => u.id === req.session.userId);
+      const actor = users.find(u => u.id === req.user.userId);
       const actorName = actor?.name?.split(" ").slice(0, 2).join(" ") || "Пользователь";
       const entry = {
         id: Date.now() + Math.random(),
-        userId: req.session.userId,
+        userId: req.user.userId,
         userName: actorName,
         message: message.slice(0, 500),
         date: new Date().toISOString(),
@@ -711,8 +787,8 @@ app.post("/api/actions/task-start", requireAuth, (req, res) => {
         throw { status: 409, message: "Задание уже закрыто" };
       }
 
-      const isWorkerRole = roleLevel(req.session.roleId) === "worker";
-      if (isWorkerRole && !(task.userIds || []).includes(req.session.userId)) {
+      const isWorkerRole = roleLevel(req.user.roleId) === "worker";
+      if (isWorkerRole && !(task.userIds || []).includes(req.user.userId)) {
         throw { status: 403, message: "Вы не назначены на это задание" };
       }
 
@@ -730,13 +806,13 @@ app.post("/api/actions/task-start", requireAuth, (req, res) => {
 
       const users = readState("dk_users") || [];
       const logs = readState("dk_logs") || [];
-      const actor = users.find(u => u.id === req.session.userId);
+      const actor = users.find(u => u.id === req.user.userId);
       const actorName = actor?.name?.split(" ").slice(0, 2).join(" ") || "Работник";
       const products = readState("dk_products") || [];
       const product = products.find(p => p.id === task.productId) || {};
       const newLog = {
         id: Date.now() + Math.random(),
-        userId: req.session.userId,
+        userId: req.user.userId,
         userName: actorName,
         message: `Начато: ${product.name || ""} x${task.quantity}`,
         date: now,
@@ -773,8 +849,8 @@ app.post("/api/actions/attendance-mark", requireAuth, (req, res) => {
   if (!ATTENDANCE_TYPES.includes(type)) {
     return res.status(400).json({ error: "Недопустимый тип отметки" });
   }
-  const isWorkerRole = roleLevel(req.session.roleId) === "worker";
-  if (isWorkerRole && eid !== req.session.userId) {
+  const isWorkerRole = roleLevel(req.user.roleId) === "worker";
+  if (isWorkerRole && eid !== req.user.userId) {
     return res.status(403).json({ error: "Вы можете отметить только себя" });
   }
   try {
@@ -789,20 +865,20 @@ app.post("/api/actions/attendance-mark", requireAuth, (req, res) => {
         time: when,
         reason: reason || "",
         comment: comment || "",
-        createdBy: req.session.userId,
+        createdBy: req.user.userId,
         createdAt: now,
       };
       const updated = [...marks, entry];
 
       const users = readState("dk_users") || [];
       const logs = readState("dk_logs") || [];
-      const actor = users.find(u => u.id === req.session.userId);
+      const actor = users.find(u => u.id === req.user.userId);
       const actorName = actor?.name?.split(" ").slice(0, 2).join(" ") || "Работник";
       const target = users.find(u => u.id === eid);
       const targetName = target?.name?.split(" ")[0] || `#${eid}`;
       const newLog = {
         id: Date.now() + Math.random(),
-        userId: req.session.userId,
+        userId: req.user.userId,
         userName: actorName,
         message: `${type}: ${targetName}`,
         date: now,
@@ -911,7 +987,7 @@ app.post("/api/state/:key", checkKeyAccess, (req, res) => {
 
 // ── UPDATES POLLING (requires auth or board mode) ──
 app.get("/api/updates", (req, res) => {
-  if (!req.session?.userId && !isBoardRequest(req)) {
+  if (!req.user && !isBoardRequest(req)) {
     return res.status(401).json([]);
   }
   try {
@@ -919,8 +995,7 @@ app.get("/api/updates", (req, res) => {
     const since = sinceRaw > 1e10 ? Math.floor(sinceRaw / 1000) : sinceRaw;
     const rows = db.prepare("SELECT key, MAX(updated_at) as ts FROM state WHERE updated_at > ? GROUP BY key").all(since);
 
-    // Filter updates by what the current user can read
-    const roleId = req.session?.roleId;
+    const roleId = req.user?.roleId;
     const filtered = rows.filter(row => {
       const access = KEY_ACCESS[row.key];
       if (!access) return roleLevel(roleId) === "admin";
@@ -939,8 +1014,8 @@ app.get("/api/updates", (req, res) => {
 // Only admin (roleId 1) or owner (roleId 4) can access.
 
 function requireAdmin(req, res, next) {
-  if (!req.session?.userId) return res.status(401).json({ error: "Не авторизован" });
-  if (roleLevel(req.session.roleId) !== "admin") return res.status(403).json({ error: "Только для администратора" });
+  if (!req.user) return res.status(401).json({ error: "Не авторизован" });
+  if (roleLevel(req.user.roleId) !== "admin") return res.status(403).json({ error: "Только для администратора" });
   next();
 }
 
@@ -993,9 +1068,9 @@ app.post("/api/admin/users", requireAdmin, (req, res) => {
       writeState("dk_users", updated);
 
       const logs = readState("dk_logs") || [];
-      const actor = users.find(u => u.id === req.session.userId);
+      const actor = users.find(u => u.id === req.user.userId);
       const actorName = actor?.name?.split(" ").slice(0, 2).join(" ") || "Админ";
-      writeState("dk_logs", [...logs, { id: Date.now() + Math.random(), userId: req.session.userId, userName: actorName, message: `Создан пользователь: ${newUser.name} (${newUser.email})`, date: now }]);
+      writeState("dk_logs", [...logs, { id: Date.now() + Math.random(), userId: req.user.userId, userName: actorName, message: `Создан пользователь: ${newUser.name} (${newUser.email})`, date: now }]);
 
       return sanitizeUser(newUser);
     })();
@@ -1064,7 +1139,7 @@ app.post("/api/admin/users/:id/block", requireAdmin, (req, res) => {
       const users = readState("dk_users") || [];
       const idx = users.findIndex(u => u.id === userId);
       if (idx === -1) throw { status: 404, message: "Пользователь не найден" };
-      if (users[idx].id === req.session.userId) throw { status: 400, message: "Нельзя заблокировать себя" };
+      if (users[idx].id === req.user.userId) throw { status: 400, message: "Нельзя заблокировать себя" };
       users[idx] = { ...users[idx], status: blocked ? "blocked" : "active", blockReason: blocked ? (reason || "") : "", updatedAt: new Date().toISOString() };
       writeState("dk_users", users);
       return sanitizeUser(users[idx]);
@@ -1185,8 +1260,11 @@ function bootstrapState() {
 
 bootstrapState();
 
-// ── HEALTH ──
-app.get("/api/ping", (_, res) => res.json({ ok: true, time: Date.now() }));
+const HOST = process.env.HOST || '127.0.0.1';
+
+// ── Health / ping (must be before SPA fallback) ──
+app.get("/api/health", (_req, res) => res.json({ ok: true, service: "dikanish-api", time: Date.now() }));
+app.get("/api/ping",   (_req, res) => res.json({ ok: true, time: Date.now() }));
 
 // ── SPA fallback ──
 app.get("*", (_req, res) => {
@@ -1195,12 +1273,6 @@ app.get("*", (_req, res) => {
   } else {
     res.status(503).send("App not built yet. Run: npm run build");
   }
-});
-
-const HOST = process.env.HOST || '127.0.0.1';
-
-app.get('/api/health', (_req, res) => {
-  res.json({ ok: true, service: 'dikanish-api', time: Date.now() });
 });
 
 app.listen(PORT, HOST, () => {
