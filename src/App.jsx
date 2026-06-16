@@ -13,6 +13,7 @@ import { EthnicBorder, Badge, Btn } from "./components/ui/index.jsx";
 // Pages and components
 import { LoginPage } from "./pages/LoginPage.jsx";
 import { NotificationBell } from "./components/layout/NotificationBell.jsx";
+import { NavSearch } from "./components/layout/NavSearch.jsx";
 import { DashboardPage } from "./pages/DashboardPage.jsx";
 import { UsersPage } from "./pages/UsersPage.jsx";
 import { ProductsPage } from "./pages/ProductsPage.jsx";
@@ -668,6 +669,7 @@ export default function App(){
           <div className="app-workspace">
             <header className="glass-topbar">
               <button onClick={()=>setSideOpen(!sideOpen)} style={{background:"rgba(255,255,255,.06)",border:"1px solid rgba(255,255,255,.10)",borderRadius:10,color:C.muted,cursor:"pointer",padding:7,display:isMobile?"flex":"none",alignItems:"center"}}><I.menu size={18}/></button>
+              <NavSearch navGroups={navGroups} onGoToPage={setPage}/>
               {isManagerLike&&(()=>{
                 const totalIncome=sales.reduce((s,sl)=>{const p=products.find(x=>x.id===sl.productId);return s+(p?.sellPrice||0)*sl.quantity},0)+clientOrders.filter(o=>o.status==="отгружен").reduce((s,o)=>s+o.total,0);
                 const totalExpense=deliveries.reduce((s,d)=>s+d.totalPrice,0);
