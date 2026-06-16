@@ -2053,6 +2053,7 @@ async function bootstrapState() {
     { id:6, name:"Грозный Сити",     zone:"Улица",  type:"hls",    url:"https://camera.vt.ru:8888/cam1/index.m3u8",                                                             enabled:true, description:"HLS-камера Вайнах Телеком — Грозный", refreshSec:5, createdAt:"2024-01-01T00:00:00" },
     { id:7, name:"Мансур (медведь)", zone:"Улица",  type:"iframe", url:"https://vkvideo.ru/video_ext.php?oid=-135955999&id=456239536&hd=1&autoplay=1",                          enabled:true, description:"Трансляция медведя Мансур — ВКонтакте", refreshSec:5, createdAt:"2024-01-01T00:00:00" },
     { id:8, name:"Плаза СПА",        zone:"Улица",  type:"iframe", url:"https://open.ivideon.com/embed/v3/?server=100-PMOSoaWrNLw3bnCEKwk7RX&camera=0&width=&height=&lang=ru", enabled:true, description:"Камера Плаза СПА — ivideon",           refreshSec:5, createdAt:"2024-01-01T00:00:00" },
+    { id:9, name:"Радио",            zone:"Прочее", type:"demo",   url:"",                                                                                                       enabled:true, description:"Демо-камера (заглушка)",               refreshSec:5, createdAt:"2024-01-01T00:00:00" },
   ];
   await seedIfMissing("dk_cameras", ALL_CAMERAS);
   // Migration: replace camera list with exactly ALL_CAMERAS (removes old demo/deleted entries)
