@@ -157,7 +157,7 @@ const DashboardPage = () => {
 
   const attendanceMarked = marks.some(m => m.employeeId === currentUser.id && (m.type === "приход" || m.markType === "присутствие") && (m.time || m.createdAt || "").startsWith(todayStr));
   const myActiveTasks = tasks.filter(t => (t.userIds || []).includes(currentUser.id) && (t.status === "назначено" || t.status === "в работе")).sort((a, b) => new Date(a.deadline) - new Date(b.deadline));
-  const myTodayProduced = (productionOutputs || []).filter(o => o.employeeId === currentUser.id && o.date.startsWith(todayStr)).reduce((s, o) => s + o.quantity, 0);
+  const myTodayProduced = (productionOutputs || []).filter(o => o.employeeId === currentUser.id && (o.date || "").startsWith(todayStr)).reduce((s, o) => s + o.quantity, 0);
 
   const activeOrders = clientOrders.filter(o => o.status !== "отгружен" && o.status !== "отменён").sort((a, b) => {
     const p = { срочный: 0, важный: 1, нормальный: 2 };

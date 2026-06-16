@@ -127,7 +127,7 @@ const ProductionOutputPage = ()=>{
 
   const totalQty=(productionOutputs||[]).reduce((s,o)=>s+o.quantity,0);
   const todayStr=new Date().toISOString().slice(0,10);
-  const todayQty=(productionOutputs||[]).filter(o=>o.date.startsWith(todayStr)).reduce((s,o)=>s+o.quantity,0);
+  const todayQty=(productionOutputs||[]).filter(o=>(o.date||"").startsWith(todayStr)).reduce((s,o)=>s+o.quantity,0);
   const selectedProd=ap.find(p=>p.id===+form.productId);
 
   return(
