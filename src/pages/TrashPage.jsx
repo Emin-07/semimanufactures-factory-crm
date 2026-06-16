@@ -12,6 +12,7 @@ const TABS = [
   { id: "orders", label: "Заказы", key: "clientOrders", setter: "setClientOrders" },
   { id: "raw", label: "Сырьё", key: "rawMaterials", setter: "setRawMaterials" },
   { id: "deliveries", label: "Поставки", key: "deliveries", setter: "setDeliveries" },
+  { id: "users", label: "Пользователи", key: "users", setter: "setUsers" },
 ];
 
 const TrashPage = () => {

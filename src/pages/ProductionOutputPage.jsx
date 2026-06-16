@@ -12,7 +12,7 @@ const ProductionOutputPage = ()=>{
   const {productionOutputs,setProductionOutputs,products,users,currentUser,addLog,addNotification,recipes,rawMaterials,setBatches,applyOutput,revertOutput,applyServerState}=useContext(AppContext);
   const role=ROLES.find(r=>r.id===currentUser.roleId);
   const isWorker=role?.name==="worker";
-  const workers=users.filter(u=>u.roleId===3&&u.status==="active");
+  const workers=users.filter(u=>u.roleId===3&&u.status==="active"&&!u.deleted);
   const ap=products.filter(p=>!p.deleted);
 
   const [modal,setModal]=useState(false);

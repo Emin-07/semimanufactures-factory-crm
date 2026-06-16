@@ -12,7 +12,7 @@ const DefectsPage = ()=>{
   const {defects,setDefects,users,products,setProducts,batches,setBatches,inventoryMovements,setInventoryMovements,currentUser,addLog}=useContext(AppContext);
   const role=ROLES.find(r=>r.id===currentUser.roleId);
   const isAdmin=role?.name==="admin"||role?.name==="owner";
-  const workers=users.filter(u=>u.status==="active"&&u.roleId===3);
+  const workers=users.filter(u=>u.status==="active"&&u.roleId===3&&!u.deleted);
   const ap=products.filter(p=>!p.deleted);
 
   const [modal,setModal]=useState(false);

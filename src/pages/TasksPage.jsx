@@ -25,7 +25,7 @@ const TasksPage = ()=>{
   const canCreate=role?.name==="admin"||role?.name==="manager";
 
   const ap=products.filter(p=>!p.deleted);
-  const workers=users.filter(u=>u.roleId===3&&u.status==="active");
+  const workers=users.filter(u=>u.roleId===3&&u.status==="active"&&!u.deleted);
   const [form,setForm]=useState({productId:ap[0]?.id||"",userIds:[],quantity:"",deadline:"",note:""});
   const [rawCheck,setRawCheck]=useState(null);
   const [empQtys,setEmpQtys]=useState({});

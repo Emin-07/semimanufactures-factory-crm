@@ -56,6 +56,7 @@ function hashPassword(plain) {
 }
 
 function verifyPassword(plain, stored) {
+  if (typeof stored !== "string" || !stored) return false;
   if (stored.startsWith("pbkdf2:")) {
     const [, salt, hash] = stored.split(":");
     const attempt = pbkdf2Sync(plain, salt, 100000, 32, "sha256").toString("hex");
@@ -148,8 +149,8 @@ function toHHMM(iso) {
 
 function sanitizeUsers(users = []) {
   return users.map(u => {
-    const { password: _p, ...rest } = u;
-    return rest;
+    const { password, ...rest } = u;
+    return { ...rest, hasPassword: typeof password === "string" && password.length > 0 };
   });
 }
 
@@ -240,17 +241,24 @@ app.post("/api/auth/login", async (req, res) => {
   try {
     const { email, password } = req.body;
     if (!email || !password) return res.status(400).json({ error: "Укажите email и пароль" });
+    const normalizedEmail = String(email).trim().toLowerCase();
 
     const users = await readState("dk_users");
     if (!users) return res.status(401).json({ error: "Пользователи не найдены" });
 
-    const user = users.find(u => u.email === email);
+    const user = users.find(u => String(u.email || "").trim().toLowerCase() === normalizedEmail);
     if (!user) return res.status(401).json({ error: "Неверный email или пароль" });
     if (user.status === "blocked") return res.status(403).json({ error: "Аккаунт заблокирован" });
-    if (!verifyPassword(password, user.password)) return res.status(401).json({ error: "Неверный email или пароль" });
+    if (user.deleted) return res.status(403).json({ error: "Аккаунт удалён" });
+    if (!verifyPassword(password, user.password)) {
+      if (typeof user.password !== "string" || !user.password) {
+        console.error(`[login] user ${user.id} (${user.email}) has no password hash set`);
+      }
+      return res.status(401).json({ error: "Неверный email или пароль" });
+    }
 
     // Lazy migration: if legacy password, upgrade to pbkdf2 on successful login
-    if (!user.password.startsWith("pbkdf2:")) {
+    if (typeof user.password === "string" && !user.password.startsWith("pbkdf2:")) {
       const newHash = hashPassword(password);
       const updated = users.map(u => u.id === user.id ? { ...u, password: newHash } : u);
       await pool.query(
@@ -303,7 +311,7 @@ app.get("/api/auth/me", async (req, res) => {
     if (req.user) {
       const user = users.find(u => u.id === req.user.userId);
       if (!user) return res.status(401).json({ error: "Пользователь не найден" });
-      if (user.status === "blocked") return res.status(403).json({ error: "Аккаунт заблокирован" });
+      if (user.status === "blocked" || user.deleted) return res.status(403).json({ error: user.deleted ? "Аккаунт удалён" : "Аккаунт заблокирован" });
       // If role was changed by admin, issue a fresh access token
       if (user.roleId !== req.user.roleId) {
         const newAccess = jwt.sign({ userId: user.id, roleId: user.roleId }, ACCESS_SECRET, { expiresIn: "15m" });
@@ -321,7 +329,7 @@ app.get("/api/auth/me", async (req, res) => {
       if (!stored) return res.status(401).json({ error: "Сессия истекла" });
       const user = users.find(u => u.id === payload.userId);
       if (!user) return res.status(401).json({ error: "Пользователь не найден" });
-      if (user.status === "blocked") return res.status(403).json({ error: "Аккаунт заблокирован" });
+      if (user.status === "blocked" || user.deleted) return res.status(403).json({ error: user.deleted ? "Аккаунт удалён" : "Аккаунт заблокирован" });
       // Issue new access token
       const newAccess = jwt.sign({ userId: user.id, roleId: user.roleId }, ACCESS_SECRET, { expiresIn: "15m" });
       res.cookie("access_token", newAccess, ACCESS_COOKIE_OPTS);
@@ -345,7 +353,7 @@ app.post("/api/auth/refresh", async (req, res) => {
     if (!stored) return res.status(401).json({ error: "Refresh токен отозван" });
     const users = await readState("dk_users") || [];
     const user = users.find(u => u.id === payload.userId);
-    if (!user || user.status === "blocked") {
+    if (!user || user.status === "blocked" || user.deleted) {
       await pool.query("DELETE FROM refresh_tokens WHERE id = $1", [payload.jti]);
       return res.status(401).json({ error: "Пользователь недоступен" });
     }
@@ -1754,6 +1762,27 @@ app.get("/api/state/:key", checkKeyAccess, async (req, res) => {
 
 app.post("/api/state/:key", checkKeyAccess, async (req, res) => {
   try {
+    // Safety net: dk_users must never lose a password hash through the generic
+    // sync endpoint (it has no concept of "password unchanged" vs "password wiped").
+    // Passwords may only be set via /api/admin/users and /api/admin/users/:id/password.
+    if (req.params.key === "dk_users") {
+      const incoming = req.body;
+      if (!Array.isArray(incoming)) return res.status(400).json({ error: "dk_users должен быть массивом" });
+      const current = await readState("dk_users") || [];
+      const byId = new Map(current.map(u => [u.id, u]));
+      const merged = incoming.map(u => {
+        if (typeof u.password === "string" && u.password.length > 0) return u;
+        const existing = byId.get(u.id);
+        if (existing && typeof existing.password === "string" && existing.password.length > 0) {
+          return { ...u, password: existing.password };
+        }
+        return u; // new user with no password, or already-corrupted account — nothing to preserve
+      });
+      const rejected = merged.find(u => !byId.has(u.id) && !(typeof u.password === "string" && u.password.length > 0));
+      if (rejected) return res.status(400).json({ error: `Пользователь без пароля: ${rejected.email || rejected.id}. Создавайте пользователей через /api/admin/users` });
+      await writeState("dk_users", merged);
+      return res.json({ ok: true });
+    }
     await writeState(req.params.key, req.body);
     res.json({ ok: true });
   } catch (e) {
@@ -1811,10 +1840,11 @@ app.post("/api/admin/users", requireAdmin, async (req, res) => {
     const { firstName, lastName, email, password, roleId, jobTitle, payType, dailyNorm, pieceRate, fixedDayRate, comment, birthDate, phone, experienceYears, experienceMonths, noExperience } = req.body;
     if (!email || !password || password.length < 4) return res.status(400).json({ error: "email и пароль (мин. 4 символа) обязательны" });
     if (!firstName && !lastName && !req.body.name) return res.status(400).json({ error: "Имя обязательно" });
+    const normalizedEmail = String(email).trim().toLowerCase();
 
     const result = await withTransaction(async (client) => {
       const users = await readState("dk_users", client) || [];
-      if (users.some(u => u.email === email)) throw { status: 409, message: "Email уже занят" };
+      if (users.some(u => String(u.email || "").trim().toLowerCase() === normalizedEmail)) throw { status: 409, message: "Email уже занят" };
 
       const expYears = noExperience ? 0 : (+experienceYears || 0);
       const expMonths = noExperience ? 0 : (+experienceMonths || 0);
@@ -1826,7 +1856,7 @@ app.post("/api/admin/users", requireAdmin, async (req, res) => {
         name: req.body.name || `${firstName || ""} ${lastName || ""}`.trim(),
         birthDate: birthDate || "",
         phone: phone || "",
-        email,
+        email: normalizedEmail,
         emailVerified: true,
         roleId: +roleId || 3,
         status: "active",
@@ -1852,9 +1882,9 @@ app.post("/api/admin/users", requireAdmin, async (req, res) => {
       const actorName = actor?.name?.split(" ").slice(0, 2).join(" ") || "Админ";
       await writeState("dk_logs", [...logs, { id: Date.now() + Math.random(), userId: req.user.userId, userName: actorName, message: `Создан пользователь: ${newUser.name} (${newUser.email})`, date: now }], client);
 
-      return sanitizeUser(newUser);
+      return { user: sanitizeUser(newUser), users: updated };
     });
-    res.json({ ok: true, user: result });
+    res.json({ ok: true, user: result.user, state: { dk_users: sanitizeUsers(result.users) } });
   } catch (e) {
     if (e.status) return res.status(e.status).json({ error: e.message });
     console.error("[admin/users POST]", e);
@@ -1881,9 +1911,9 @@ app.patch("/api/admin/users/:id", requireAdmin, async (req, res) => {
       }
       const newUsers = users.map((u, i) => i === idx ? updated : u);
       await writeState("dk_users", newUsers, client);
-      return sanitizeUser(updated);
+      return { user: sanitizeUser(updated), users: newUsers };
     });
-    res.json({ ok: true, user: result });
+    res.json({ ok: true, user: result.user, state: { dk_users: sanitizeUsers(result.users) } });
   } catch (e) {
     if (e.status) return res.status(e.status).json({ error: e.message });
     res.status(500).json({ error: e.message });
@@ -1896,14 +1926,15 @@ app.post("/api/admin/users/:id/password", requireAdmin, async (req, res) => {
     const userId = +req.params.id;
     const { newPassword } = req.body;
     if (!newPassword || newPassword.length < 4) return res.status(400).json({ error: "Пароль мин. 4 символа" });
-    await withTransaction(async (client) => {
+    const result = await withTransaction(async (client) => {
       const users = await readState("dk_users", client) || [];
       const idx = users.findIndex(u => u.id === userId);
       if (idx === -1) throw { status: 404, message: "Пользователь не найден" };
-      users[idx] = { ...users[idx], password: hashPassword(newPassword), updatedAt: new Date().toISOString() };
-      await writeState("dk_users", users, client);
+      const newUsers = users.map((u, i) => i === idx ? { ...u, password: hashPassword(newPassword), updatedAt: new Date().toISOString() } : u);
+      await writeState("dk_users", newUsers, client);
+      return newUsers;
     });
-    res.json({ ok: true });
+    res.json({ ok: true, state: { dk_users: sanitizeUsers(result) } });
   } catch (e) {
     if (e.status) return res.status(e.status).json({ error: e.message });
     res.status(500).json({ error: e.message });
@@ -1922,9 +1953,9 @@ app.post("/api/admin/users/:id/block", requireAdmin, async (req, res) => {
       if (users[idx].id === req.user.userId) throw { status: 400, message: "Нельзя заблокировать себя" };
       users[idx] = { ...users[idx], status: blocked ? "blocked" : "active", blockReason: blocked ? (reason || "") : "", updatedAt: new Date().toISOString() };
       await writeState("dk_users", users, client);
-      return sanitizeUser(users[idx]);
+      return { user: sanitizeUser(users[idx]), users };
     });
-    res.json({ ok: true, user: result });
+    res.json({ ok: true, user: result.user, state: { dk_users: sanitizeUsers(result.users) } });
   } catch (e) {
     if (e.status) return res.status(e.status).json({ error: e.message });
     res.status(500).json({ error: e.message });
@@ -2023,6 +2054,7 @@ async function bootstrapState() {
     { id:6, name:"Грозный Сити",     zone:"Улица",  type:"hls",    url:"https://camera.vt.ru:8888/cam1/index.m3u8",                                                             enabled:true, description:"HLS-камера Вайнах Телеком — Грозный", refreshSec:5, createdAt:"2024-01-01T00:00:00" },
     { id:7, name:"Мансур (медведь)", zone:"Улица",  type:"iframe", url:"https://vkvideo.ru/video_ext.php?oid=-135955999&id=456239536&hd=1&autoplay=1",                          enabled:true, description:"Трансляция медведя Мансур — ВКонтакте", refreshSec:5, createdAt:"2024-01-01T00:00:00" },
     { id:8, name:"Плаза СПА",        zone:"Улица",  type:"iframe", url:"https://open.ivideon.com/embed/v3/?server=100-PMOSoaWrNLw3bnCEKwk7RX&camera=0&width=&height=&lang=ru", enabled:true, description:"Камера Плаза СПА — ivideon",           refreshSec:5, createdAt:"2024-01-01T00:00:00" },
+    { id:9, name:"Радио",            zone:"Прочее", type:"demo",   url:"",                                                                                                       enabled:true, description:"Демо-камера (заглушка)",               refreshSec:5, createdAt:"2024-01-01T00:00:00" },
   ];
   await seedIfMissing("dk_cameras", ALL_CAMERAS);
   // Migration: replace camera list with exactly ALL_CAMERAS (removes old demo/deleted entries)

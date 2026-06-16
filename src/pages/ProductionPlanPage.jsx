@@ -16,7 +16,7 @@ const ProductionPlanPage = ()=>{
   const [viewMode,setViewMode]=useState("week"); // day, week, month
   const [dateOffset,setDateOffset]=useState(0);
   const ap=products.filter(p=>!p.deleted);
-  const workers=users.filter(u=>u.roleId===3&&u.status==="active");
+  const workers=users.filter(u=>u.roleId===3&&u.status==="active"&&!u.deleted);
   const [form,setForm]=useState({productId:ap[0]?.id||"",plannedQty:"",productionDate:"",employeeIds:[]});
 
   const today=new Date();

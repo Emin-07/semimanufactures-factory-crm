@@ -40,7 +40,7 @@ const DashboardPage = () => {
   const todayTasks = tasks.filter(t => t.completedAt && t.completedAt.startsWith(todayStr));
   const todayProduced = todayTasks.reduce((s, t) => s + t.quantity, 0);
 
-  const allWorkers = users.filter(u => u.roleId === 3 && u.status === "active");
+  const allWorkers = users.filter(u => u.roleId === 3 && u.status === "active" && !u.deleted);
   const busyWorkerIds = new Set();
   tasks.filter(t => t.status === "в работе").forEach(t => (t.userIds || []).forEach(id => busyWorkerIds.add(id)));
   const busyCount = busyWorkerIds.size;
@@ -368,7 +368,7 @@ const DashboardPage = () => {
     const arrivedIds = new Set(marks.filter(m => (m.type === "приход" || m.markType === "присутствие") && (m.time || m.createdAt || "").startsWith(todayStr)).map(m => m.employeeId));
     const departedIds = new Set(marks.filter(m => m.type === "уход" && (m.time || m.createdAt || "").startsWith(todayStr)).map(m => m.employeeId));
     const absentIds = new Set(marks.filter(m => m.type === "отсутствие" && (m.time || m.createdAt || "").startsWith(todayStr)).map(m => m.employeeId));
-    const prodWorkers = users.filter(u => u.roleId === 3 && u.status === "active");
+    const prodWorkers = users.filter(u => u.roleId === 3 && u.status === "active" && !u.deleted);
     const noShowWorkers = prodWorkers.filter(w => !arrivedIds.has(w.id) && !absentIds.has(w.id));
     const finishedCount = prodWorkers.filter(w => arrivedIds.has(w.id) && departedIds.has(w.id)).length;
 
