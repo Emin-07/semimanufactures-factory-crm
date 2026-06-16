@@ -30,7 +30,7 @@ const WorkerHistoryPage = ()=>{
   const history=useMemo(()=>{
     let h=[...employeeHistory.filter(eh=>eh.employeeId===+selectedWorker)];
     if(monthFilter){
-      h=h.filter(eh=>eh.date.startsWith(monthFilter));
+      h=h.filter(eh=>(eh.date||"").startsWith(monthFilter));
     }
     return h.sort((a,b)=>new Date(b.date)-new Date(a.date));
   },[employeeHistory,selectedWorker,monthFilter]);
@@ -38,7 +38,7 @@ const WorkerHistoryPage = ()=>{
   // Generate month options from history
   const months=useMemo(()=>{
     const s=new Set();
-    employeeHistory.filter(eh=>eh.employeeId===+selectedWorker).forEach(eh=>{s.add(eh.date.slice(0,7))});
+    employeeHistory.filter(eh=>eh.employeeId===+selectedWorker&&eh.date).forEach(eh=>{s.add(eh.date.slice(0,7))});
     return [...s].sort().reverse();
   },[employeeHistory,selectedWorker]);
 

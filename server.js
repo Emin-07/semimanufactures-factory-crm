@@ -34,10 +34,13 @@ async function initDb() {
   await pool.query(`
     CREATE TABLE IF NOT EXISTS refresh_tokens (
       id TEXT PRIMARY KEY,
-      user_id INTEGER NOT NULL,
+      user_id BIGINT NOT NULL,
       expires_at INTEGER NOT NULL
     )
   `);
+  // Migrate pre-existing deployments: user ids are Date.now() timestamps (13 digits),
+  // which overflow the old INTEGER column (max ~2.1bn) and fail every new user's login.
+  await pool.query("ALTER TABLE refresh_tokens ALTER COLUMN user_id TYPE BIGINT");
   await pool.query("DELETE FROM refresh_tokens WHERE expires_at < EXTRACT(EPOCH FROM NOW())::INTEGER");
 }
 
